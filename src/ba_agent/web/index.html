@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BA Agent · Requirements Interview</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
+<script defer src="/vendor/marked.min.js"></script>
+<script defer src="/vendor/mermaid.min.js"></script>
+<script defer src="/app.js"></script>
+</head>
+<body>
+<div id="app" class="layout">
+
+  <!-- ---------------------------------------------------------------- sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark">BA</span>
+      <div>
+        <div class="brand-title">Requirements Agent</div>
+        <div class="brand-sub">LangChain · LM Studio</div>
+      </div>
+    </div>
+
+    <button id="btn-new" class="btn btn-primary btn-block">＋ New interview</button>
+
+    <div class="side-section">
+      <div class="side-title">Sessions</div>
+      <ul id="session-list" class="session-list"><li class="empty">loading…</li></ul>
+    </div>
+
+    <div class="side-section grow">
+      <div class="side-title">Knowledge base</div>
+      <div id="kb-status" class="kb-status">checking…</div>
+      <form id="kb-form" class="kb-form">
+        <input type="file" id="kb-files" multiple accept=".pdf,.docx,.txt,.md,.csv,.json,.yaml,.yml">
+        <button class="btn btn-ghost btn-sm" type="submit">Index files</button>
+        <button class="btn btn-ghost btn-sm" type="button" id="kb-index-dir">Index data/</button>
+      </form>
+    </div>
+
+    <div class="side-footer">
+      <span id="health-dot" class="dot dot-off"></span><span id="health-text">LM Studio: checking…</span>
+    </div>
+  </aside>
+
+  <!-- ------------------------------------------------------------------- main -->
+  <main class="main">
+    <header class="topbar">
+      <div class="session-head">
+        <h1 id="session-title">No session selected</h1>
+        <div id="session-meta" class="muted small"></div>
+      </div>
+      <div class="controls">
+        <label class="model-picker">
+          <span class="ctl-label">Model</span>
+          <select id="model-select" title="LM Studio model used for the next step"></select>
+        </label>
+        <button id="btn-advanced" class="btn btn-ghost btn-sm" title="Per-role model overrides">⋯</button>
+        <button id="btn-resume" class="btn btn-ghost btn-sm" hidden>Resume</button>
+        <button id="btn-stop" class="btn btn-danger btn-sm" hidden>Stop</button>
+      </div>
+    </header>
+
+    <nav id="stepper" class="stepper" aria-label="workflow progress"></nav>
+
+    <section id="timeline" class="timeline">
+      <div class="welcome">
+        <h2>Business Analyst interview agent</h2>
+        <p>Describe a project; the agent interviews you subject by subject, then produces an approved requirements
+          summary, a Functional Specification Document and process diagrams.</p>
+        <ul>
+          <li><b>Control flow is deterministic</b> — the model only writes content, never decides what happens next.</li>
+          <li><b>Resumable</b> — close the tab or restart the server; the interview continues where it stopped.</li>
+          <li><b>Local-first</b> — every call goes to LM Studio on your machine.</li>
+        </ul>
+        <p class="muted">Press <b>New interview</b> to start.</p>
+      </div>
+    </section>
+
+    <footer class="composer" id="composer" hidden>
+      <div id="question-card" class="question-card" hidden></div>
+      <form id="answer-form" class="answer-form">
+        <textarea id="answer-input" rows="2" placeholder="Answer the question above…"></textarea>
+        <div class="answer-actions">
+          <button type="submit" class="btn btn-primary">Send answer</button>
+          <button type="button" class="btn btn-ghost" data-skip="skip">Skip</button>
+          <button type="button" class="btn btn-ghost" data-skip="na">Not applicable</button>
+        </div>
+      </form>
+      <form id="chat-form" class="chat-form">
+        <input id="chat-input" placeholder="Ask the BA anything (what have you captured? change FR-002 to …)">
+        <button type="submit" class="btn btn-ghost">Ask</button>
+      </form>
+    </footer>
+  </main>
+
+  <!-- -------------------------------------------------------------- right pan -->
+  <section class="panel">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="spec">Spec</button>
+      <button class="tab" data-tab="diagram">Diagram</button>
+      <button class="tab" data-tab="ledger">Ledger</button>
+      <button class="tab" data-tab="artifacts">Files</button>
+      <button class="tab" data-tab="trace">Trace</button>
+    </div>
+    <div class="tab-body">
+      <div id="tab-spec" class="tab-pane active markdown-body"><p class="muted">The functional specification appears here as it is written.</p></div>
+      <div id="tab-diagram" class="tab-pane"><div class="diagram-toolbar"><button id="btn-diagram-refresh" class="btn btn-ghost btn-sm">Re-render</button><span id="diagram-status" class="muted small"></span></div><div id="diagram-view" class="diagram-view"></div><pre id="diagram-source" class="code-block" hidden></pre></div>
+      <div id="tab-ledger" class="tab-pane"><p class="muted">Captured facts and requirements appear here.</p></div>
+      <div id="tab-artifacts" class="tab-pane"><p class="muted">No artefacts yet.</p></div>
+      <div id="tab-trace" class="tab-pane mono small"></div>
+    </div>
+  </section>
+</div>
+
+<!-- ------------------------------------------------------------------ modals -->
+<dialog id="dlg-new">
+  <form method="dialog" id="new-form">
+    <h2>New requirements interview</h2>
+    <label>Project brief
+      <textarea id="new-brief" rows="7" required placeholder="e.g. We need a portal for insurance brokers to submit and track claims. Currently everything is by email. Around 300 brokers, peak in winter, must integrate with the existing policy system (REST) and respect GDPR…"></textarea>
+    </label>
+    <div class="row">
+      <label>Title (optional)<input id="new-title" placeholder="Claims broker portal"></label>
+      <label>Model<select id="new-model"></select></label>
+    </div>
+    <label>Reference URLs to index first (one per line, optional)
+      <textarea id="new-urls" rows="2" placeholder="https://…"></textarea>
+    </label>
+    <p class="muted small">The interview starts immediately after creation. Nothing leaves your machine except indexed URLs you type here.</p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-ghost">Cancel</button>
+      <button value="create" class="btn btn-primary" id="new-create">Start interview</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-advanced">
+  <form method="dialog" id="adv-form">
+    <h2>Per-role models</h2>
+    <p class="muted small">Leave a role empty to use the default model. Changes apply from the next step — no restart.</p>
+    <div id="role-grid" class="role-grid"></div>
+    <label>Embedding model (knowledge base)<select id="embedding-select"></select></label>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-ghost">Close</button>
+      <button value="save" class="btn btn-primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-reject">
+  <form method="dialog" id="reject-form">
+    <h2>Request changes to the summary</h2>
+    <label>What is wrong or missing?
+      <textarea id="reject-notes" rows="5" placeholder="e.g. Mobile access is out of scope; we also need an approval step by the team leader…"></textarea>
+    </label>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-ghost">Cancel</button>
+      <button value="send" class="btn btn-primary">Send back to interview</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+</body>
+</html>

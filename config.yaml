@@ -1,0 +1,75 @@
+# BA Agent configuration — everything here can also be set via environment variables
+# (see .env.example) or changed at runtime from the web UI for models.
+
+server:
+  host: 127.0.0.1
+  port: 8765
+  # The UI is served by this same process, so you normally only need these two origins.
+  cors_origins:
+    - "http://127.0.0.1:8765"
+    - "http://localhost:8765"
+
+lmstudio:
+  base_url: "http://127.0.0.1:1234/v1"     # OpenAI-compatible endpoint
+  admin_url: "http://127.0.0.1:1234/api/v0" # used for the model dropdown (load state, context, tool support)
+  api_key: "lm-studio"                      # LM Studio ignores it but the client requires a value
+  request_timeout_s: 600                    # generous: switching/loading a big local model takes minutes
+  connect_timeout_s: 10
+  max_concurrency: 1                        # never let two sessions fight for VRAM
+  default_model: null                       # null → first *loaded* chat model (pick it in the UI instead)
+  embedding_model: "text-embedding-nomic-embed-text-v1.5"   # must be downloaded/available in LM Studio
+  structured_output_method: auto            # auto | json_schema | function_calling | prompt
+  max_retries: 2                            # retries per method before falling to the next rung
+
+# Per-role model + sampling overrides. `model: null` means "use lmstudio.default_model".
+# Tip on small hardware: a fast 8B for interview/triage and a bigger one for writer/use_cases works well.
+#
+# Note on max_output_tokens: thinking models (e.g. Qwen3 served by LM Studio) spend thousands of tokens on
+# internal reasoning before any visible output — a small cap starves them and the section comes back empty.
+# Keep these generous; if a capped call still returns nothing visible, the gateway retries once without a cap.
+roles:
+  plan:            { temperature: 0.2 }
+  interview:       { temperature: 0.6 }
+  triage:          { temperature: 0.1 }
+  summary:         { temperature: 0.3 }
+  writer:          { temperature: 0.4, max_output_tokens: 16384 }
+  use_cases:       { temperature: 0.5, max_output_tokens: 16384 }
+  glossary:        { temperature: 0.3 }
+  critic:          { temperature: 0.1 }
+  diagrammer:      { temperature: 0.3 }
+  mermaid_reviewer:{ temperature: 0.1 }
+
+interview:
+  max_questions_per_subject: 2   # hard cap per subject (initial question + one follow-up)
+  min_subjects: 4
+  max_subjects: 9
+  max_gap_rounds: 2              # clarification rounds after the agenda interview
+  max_gap_questions_per_round: 3
+  max_summary_rejections: 2      # "request changes" at the approval gate; after that the notes go to drafting
+  max_total_questions: 40        # absolute ceiling so a run can never stall
+
+review:
+  max_review_rounds: 2           # writer↔critic iterations; leftovers ship as open questions
+  min_functional_requirements: 5
+  require_acceptance_criteria: true
+
+diagram:
+  max_revision_rounds: 1
+  max_diagrams: 3
+  # Optional external Mermaid renderer/parser (e.g. https://kroki.io). Disabled by default because it
+  # would send your specification to a third party. The browser renders diagrams locally regardless.
+  validator_url: null
+
+knowledge:
+  docs_dir: data                 # drop PDFs / DOCX / MD / TXT here, then "Index data/" in the UI
+  chunk_size: 900
+  chunk_overlap: 140
+  top_k: 6
+  min_score: 0.05
+  embed_batch_size: 16
+
+paths:
+  state_dir: state               # SQLite database (sessions, events, knowledge base)
+  outputs_dir: outputs           # per-session deliverables
+  logs_dir: logs
+  prompts_dir: prompts           # editable Jinja2 prompt templates (*.md.j2)

@@ -1,0 +1,29 @@
+# secrets — never commit these (v1 had .env in the repo folder)
+.env
+*.key
+*.pem
+
+# local state & artefacts
+state/
+outputs/
+logs/
+data/*
+!data/.gitkeep
+uploads/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# node / editors
+node_modules/
+.DS_Store
+.idea/
+.vscode/
