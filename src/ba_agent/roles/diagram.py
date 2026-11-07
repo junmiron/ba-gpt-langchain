@@ -44,10 +44,14 @@ async def generate_diagrams(services: Services, state: SessionState, *, emit: Em
                                                "message": "auto-fixed Mermaid syntax (quoted labels)"})
                 code, report = auto_fixed, retry
             else:
-                repaired = await _repair(services, state, auto_fixed, retry.errors + report.errors, emit=emit)
+                # The model repairs the auto-fixed code, and the result is judged against that baseline. Comparing
+                # with the original draft rejected repairs that were already better than what the model received.
+                # When no repair wins, the auto-fixed code is kept — it is still better than the raw draft.
+                code, report = auto_fixed, retry
+                repaired = await _repair(services, state, auto_fixed, retry.errors, emit=emit)
                 if repaired:
                     candidate_report = validate_mermaid(repaired)
-                    if candidate_report.ok or len(candidate_report.errors) < len(report.errors):
+                    if candidate_report.ok or len(candidate_report.errors) < len(retry.errors):
                         code, report = candidate_report.code, candidate_report
 
         svg, render_error = await render_svg(code, cfg.validator_url)
@@ -89,6 +93,9 @@ async def review_diagram(services: Services, state: SessionState, diagram: dict,
     )
     parsed = result.parsed if isinstance(result.parsed, MermaidReviewResult) else None
     if parsed is None:
+        await emit(EventType.WARNING, {"step": step, "role": "mermaid_reviewer",
+                                       "message": "diagram reviewer unavailable — keeping the validator's verdict only",
+                                       "detail": (result.error or "")[:300]})
         return {"approved": not validation_errors, "summary": "reviewer unavailable", "issues": list(validation_errors),
                 "revised_code": ""}
 

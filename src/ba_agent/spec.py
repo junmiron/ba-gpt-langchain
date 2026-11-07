@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal
 
-from .schemas import LedgerItem, SessionState
+from .schemas import SessionState
 
 SectionKind = Literal["llm", "use_cases", "glossary", "static"]
 
@@ -230,6 +230,25 @@ NFR_TOPICS = {
     "scalability": ("scal", "capacity", "concurrent", "volume"),
 }
 
+#: Needles that must match as whole words. Plain substring search made "sla" fire on "island" and "slate".
+_WHOLE_WORD_NEEDLES = frozenset({"sla", "rto", "rpo", "rbac", "gdpr"})
+
+
+def _mentions(text: str, needle: str) -> bool:
+    if needle in _WHOLE_WORD_NEEDLES:
+        return re.search(rf"\b{re.escape(needle)}\b", text) is not None
+    return needle in text
+
+
+def nfr_topics_mentioned(text: str) -> set[str]:
+    """Quality-attribute topics named in ``text`` (lower-cased by the caller or here)."""
+    lowered = text.lower()
+    return {topic for topic, needles in NFR_TOPICS.items() if any(_mentions(lowered, n) for n in needles)}
+
+
+#: Uncovered-topic count at which both the linter and the gap detector report a missing quality attribute group.
+NFR_UNCOVERED_THRESHOLD = 3
+
 
 def lint_spec(state: SessionState, *, min_functional_requirements: int = 5) -> list[LintFinding]:
     findings: list[LintFinding] = []
@@ -280,10 +299,9 @@ def lint_spec(state: SessionState, *, min_functional_requirements: int = 5) -> l
                                     f"{', '.join(must_without_acceptance[:12])}.",
                                     "warning", "internal"))
 
-    text = doc.lower()
-    covered_topics = {topic for topic, needles in NFR_TOPICS.items() if any(n in text for n in needles)}
+    covered_topics = nfr_topics_mentioned(doc)
     uncovered = sorted(set(NFR_TOPICS) - covered_topics)
-    if len(uncovered) >= 3:
+    if len(uncovered) >= NFR_UNCOVERED_THRESHOLD:
         findings.append(LintFinding("nfr_coverage",
                                     f"Non-functional targets not addressed for: {', '.join(uncovered)}.",
                                     "warning", "user"))
@@ -305,15 +323,20 @@ def lint_spec(state: SessionState, *, min_functional_requirements: int = 5) -> l
     return findings
 
 
-def deterministic_gaps(state: SessionState) -> list[str]:
-    """Findings that need stakeholder input — feeds the clarify phase (no model needed to detect them)."""
+def deterministic_gaps(state: SessionState, *, min_functional_requirements: int = 5) -> list[str]:
+    """Findings that need stakeholder input — feeds the clarify phase (no model needed to detect them).
+
+    ``min_functional_requirements`` must be the same ``config.review.min_functional_requirements`` that
+    :func:`lint_spec` uses, otherwise the interview and the linter disagree about how many requirements is enough.
+    """
     gaps: list[str] = []
     requirements = state.requirements()
     functional = [r for r in requirements if r.category and r.category.value == "functional"]
 
-    if len(functional) < 5:
-        gaps.append(f"Only {len(functional)} functional requirement(s) captured — we need the main capabilities "
-                    f"the system must provide.")
+    floor = max(1, int(min_functional_requirements))
+    if len(functional) < floor:
+        gaps.append(f"Only {len(functional)} functional requirement(s) captured (expected at least {floor}) — "
+                    f"we need the main capabilities the system must provide.")
     if not any(r.category and r.category.value == "non_functional" for r in requirements):
         gaps.append("No non-functional targets (performance, security, availability) were captured.")
     if not state.summary or not state.summary.scope_in:
@@ -321,10 +344,9 @@ def deterministic_gaps(state: SessionState) -> list[str]:
     if not any(i.kind == "decision" for i in state.ledger):
         gaps.append("No explicit design decisions recorded yet — which options were ruled out matters to delivery.")
 
-    text = " ".join((i.body + " " + i.title).lower() for i in state.ledger)
-    missing_topics = sorted(topic for topic, needles in NFR_TOPICS.items()
-                            if not any(needle in text for needle in needles))
-    if len(missing_topics) >= 2:
+    text = " ".join((i.body + " " + i.title) for i in state.ledger)
+    missing_topics = sorted(set(NFR_TOPICS) - nfr_topics_mentioned(text))
+    if len(missing_topics) >= NFR_UNCOVERED_THRESHOLD:
         gaps.append("These quality attributes are untouched: " + ", ".join(missing_topics) + ".")
 
     return gaps
@@ -342,7 +364,3 @@ def spec_stats(state: SessionState) -> dict[str, Any]:
         "with_acceptance": sum(1 for r in requirements if r.acceptance),
         "tbd_placeholders": len(re.findall(r"\bTBD\b", doc, flags=re.I)),
     }
-
-
-def ledger_lines(items: list[LedgerItem], kinds: tuple[str, ...] | None = None) -> list[str]:
-    return [item.as_line() for item in items if kinds is None or item.kind in kinds]

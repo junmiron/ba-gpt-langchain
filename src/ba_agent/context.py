@@ -119,12 +119,14 @@ def transcript_lines(qa_rows: list[dict], *, limit: int = 40) -> list[str]:
     for row in qa_rows[-limit:]:
         subject = row.get("subject") or ""
         question = re.sub(r"\s+", " ", (row.get("question") or "").strip())
-        answer = row.get("answer")
-        if answer is None:
-            continue
-        answer_text = "(skipped)" if row.get("skipped") else re.sub(r"\s+", " ", str(answer).strip())
         if row.get("na"):
             answer_text = "(not applicable)"
+        elif row.get("skipped"):
+            answer_text = "(skipped)"
+        elif row.get("answer") is None:
+            continue  # unanswered question, nothing to show the model
+        else:
+            answer_text = re.sub(r"\s+", " ", str(row.get("answer")).strip())
         lines.append(f"Q{row.get('q_index')} [{subject}] {question} → {answer_text}")
     return lines
 

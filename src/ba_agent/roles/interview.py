@@ -155,5 +155,10 @@ async def probe_coverage(services: Services, state: SessionState, subject_name: 
     )
     decision = result.parsed if isinstance(result.parsed, ProbeDecision) else None
     if decision is None:
+        await emit(EventType.WARNING, {
+            "step": f"probe:{subject_name}", "role": "interview",
+            "message": "coverage probe unavailable — treating the subject as covered and moving on (degraded)",
+            "detail": (result.error or "")[:300],
+        })
         return ProbeDecision(covered=True, reason="coverage probe unavailable — moving on")
     return decision

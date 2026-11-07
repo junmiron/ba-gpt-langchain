@@ -303,14 +303,14 @@ class WorkflowEngine:
 
         budget_left = state.gap_round < cfg.max_gap_rounds and len(state.questions) < cfg.max_total_questions
         if not budget_left:
-            if deterministic_gaps(state):
+            if deterministic_gaps(state, min_functional_requirements=self.config.review.min_functional_requirements):
                 await emit(EventType.WARNING, {"step": "clarify",
                                                "message": f"gap-round budget ({cfg.max_gap_rounds}) exhausted — "
                                                           "remaining gaps are listed as open questions"})
             state.phase = Phase.SUMMARY
             return
 
-        code_gaps = deterministic_gaps(state)
+        code_gaps = deterministic_gaps(state, min_functional_requirements=self.config.review.min_functional_requirements)
         gaps = await analysis.gap_analysis(self.services, state, code_gaps, emit=emit)
         asked = {q.text.strip().lower() for q in state.questions}
         fresh = [gap for gap in gaps if gap.question.strip().lower() not in asked]

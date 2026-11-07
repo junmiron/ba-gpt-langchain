@@ -17,7 +17,12 @@ DIAGRAM_KEYWORDS = ("flowchart", "graph", "sequenceDiagram", "stateDiagram", "cl
 RESERVED_IDS = {"end", "graph", "class", "subgraph", "click", "style", "linkStyle"}
 _NODE_DECL_RE = re.compile(r"(?P<id>[A-Za-z0-9_\u00C0-\u024F]+)\s*(?P<open>[\[{\(])")
 _ARROW_RE = re.compile(r"(-->|->>|---|--|\\.\\.>|==>)")
-_UNQUOTED_RISKY_RE = re.compile(r"(?P<open>[\[{(])\s*(?P<label>[^\]})]*)[\]})]")
+# A node label is a run of plain characters or one balanced ``(...)`` group, so ``A[total (net)]`` is matched
+# whole. The closer must pair with the opener; a stray mismatch (``A[x (y]``) is left for the validator to flag.
+_UNQUOTED_RISKY_RE = re.compile(
+    r"(?P<open>[\[{(])(?P<label>(?:[^\[\]{}()\"]|\([^\[\]{}()]*\))*)(?P<close>[\]})])"
+)
+_CLOSER_FOR = {"[": "]", "{": "}", "(": ")"}
 _DIRECTIONS = {"TD", "TB", "BT", "LR", "RL"}
 
 
@@ -134,8 +139,8 @@ def quote_risky_labels(code: str) -> str:
 
         def _fix(match: re.Match[str]) -> str:
             label = (match.group("label") or "").strip()
-            opener, closer = match.group("open"), match.group(0)[-1]
-            if not _label_is_risky(opener, label):
+            opener, closer = match.group("open"), match.group("close")
+            if _CLOSER_FOR.get(opener) != closer or not _label_is_risky(opener, label):
                 return match.group(0)
             safe = label.replace('"', "'")
             return f'{opener}"{safe}"{closer}'

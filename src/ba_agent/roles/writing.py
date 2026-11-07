@@ -64,15 +64,18 @@ async def write_section(services: Services, state: SessionState, section: Sectio
 
 async def write_use_cases(services: Services, state: SessionState, *, emit: Emitter = null_emitter) -> str:
     stakeholders = []
-    if state.summary and state.summary.stakeholders:
-        stakeholders = list(state.summary.stakeholders)
+    summary = state.summary
+    if summary and summary.stakeholders:
+        stakeholders = list(summary.stakeholders)
     else:
         stakeholders = [line for line in facts_lines(state)
                         if re.search(r"\b(role|user|persona|team|admin|analyst)\b", line.lower())][:8]
 
+    scope_in = list(summary.scope_in) if summary else []
+    scope_out = list(summary.scope_out) if summary else []
     process_context = "\n".join(filter(None, [
-        (state.summary.scope_in and "In scope: " + "; ".join(state.summary.scope_in[:8])) or "",
-        (state.summary.scope_out and "Out of scope: " + "; ".join(state.summary.scope_out[:8])) or "",
+        ("In scope: " + "; ".join(scope_in[:8])) if scope_in else "",
+        ("Out of scope: " + "; ".join(scope_out[:8])) if scope_out else "",
     ])) or "(scope not explicitly captured — derive it from the requirements)"
 
     system, user = render(

@@ -118,6 +118,11 @@ async def gap_analysis(services: Services, state: SessionState, deterministic_ga
     parsed = result.parsed if isinstance(result.parsed, GapAnalysis) else None
     if parsed is None:
         # Deterministic findings are still actionable questions — use them rather than inventing nothing.
+        await emit(EventType.WARNING, {
+            "step": "gap_analysis", "role": "interview",
+            "message": "gap analysis unavailable — using the deterministic checker's gaps only (degraded)",
+            "detail": (result.error or "")[:300],
+        })
         return [GapItem(subject="Clarification", question=gap, why="detected by the completeness checker")
                 for gap in deterministic_gaps[: cfg.max_gap_questions_per_round]]
 
@@ -133,10 +138,16 @@ def deterministic_summary(state: SessionState) -> SummaryDoc:
     return SummaryDoc(
         project_name=(plan.project_name if plan else state.title),
         objective=(plan.objective if plan else ""),
-        background=(plan.summary if plan else state.brief[:400]),
+        background="\n".join(filter(None, [
+            (plan.summary if plan else state.brief[:400]),
+            *[f"Functional requirement {r.id}: {r.body}" for r in requirements
+              if r.category and r.category.value == "functional"][:12],
+        ])),
         objectives=[(plan.objective if plan and plan.objective else "")][:1],
         stakeholders=stakeholders[:8],
-        scope_in=[r.body for r in requirements if r.category and r.category.value == "functional"][:12],
+        # Scope comes from explicit in-scope facts only. Stuffing functional requirement bodies here made the
+        # scope-gap check pass on a degraded run even though the boundary was never discussed.
+        scope_in=[],
         scope_out=[],
         key_requirements=[f"{r.id} {r.title or r.body}" for r in requirements[:12]],
         non_functional=[r.body for r in requirements if r.category and r.category.value == "non_functional"][:8],

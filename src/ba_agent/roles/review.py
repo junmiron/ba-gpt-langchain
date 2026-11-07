@@ -28,10 +28,42 @@ def verdict_from_lint(findings: list[LintFinding]) -> CriticVerdict:
                          issues=issues)
 
 
+#: The critic reviews the whole document where it fits. Beyond the cap the head keeps the early sections and
+#: the tail keeps the glossary, traceability and open questions, which sit at the end of the spec.
+CRITIC_SPEC_HEAD_CHARS = 12_000
+CRITIC_SPEC_TAIL_CHARS = 6_000
+
+
+def _spec_for_critic(document: str) -> str:
+    limit = CRITIC_SPEC_HEAD_CHARS + CRITIC_SPEC_TAIL_CHARS
+    if len(document) <= limit:
+        return document
+    omitted = len(document) - limit
+    return (f"{document[:CRITIC_SPEC_HEAD_CHARS]}\n\n[… {omitted} characters omitted from the middle of the document …]"
+            f"\n\n{document[-CRITIC_SPEC_TAIL_CHARS:]}")
+
+
+#: Upper bound on issues shown to the writer per review round.
+MAX_REVIEW_ISSUES = 12
+
+
+def _cap_issues(issues: list[Issue]) -> list[Issue]:
+    """Keep every lint blocker (authoritative) first, then fill the remaining slots with the rest in order.
+
+    A plain ``[:12]`` slice let critic issues that came first push lint blockers out of the list, so a round
+    could pass with real blockers dropped.
+    """
+    blockers = [i for i in issues if i.severity == "blocker" and i.source == "lint"]
+    if len(blockers) >= MAX_REVIEW_ISSUES:
+        return blockers
+    rest = [i for i in issues if not (i.severity == "blocker" and i.source == "lint")]
+    return blockers + rest[: MAX_REVIEW_ISSUES - len(blockers)]
+
+
 async def critique(services: Services, state: SessionState, findings: list[LintFinding], *,
                    emit: Emitter = null_emitter) -> CriticVerdict:
     lint_lines = [finding.line() for finding in findings]
-    document = (state.spec_markdown or "")[:14_000]
+    document = _spec_for_critic(state.spec_markdown or "")
 
     system, user = render(
         "critic",
@@ -60,7 +92,7 @@ async def critique(services: Services, state: SessionState, findings: list[LintF
     for finding in findings:
         if finding.message.strip().lower() not in seen:
             merged.extend(issues_from_lint([finding]))
-    verdict.issues = merged[:12]
+    verdict.issues = _cap_issues(merged)
 
     # Re-derive status so a critic that says "complete" while blockers exist cannot pass the gate.
     blockers = [i for i in verdict.issues if i.severity == "blocker"]

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from enum import Enum
 from typing import Any, Literal
 
@@ -56,6 +57,47 @@ def one_of(value: Any, allowed: tuple[str, ...], default: str) -> str:
         if option in text or text in option:
             return option
     return default
+
+
+def match_canonical(value: Any, options: tuple[str, ...], default: str) -> str:
+    """Map a model string onto a canonical option, ignoring case, spaces, hyphens and underscores.
+
+    ``'High'`` -> ``'high'``, ``'sequence diagram'`` -> ``'sequenceDiagram'``. Unlike :func:`one_of` the canonical
+    spelling (camelCase included) is returned. An option matches when its normalised form is contained in the
+    model's string, so ``'Sequence Diagram (UML)'`` also resolves.
+    """
+    key = re.sub(r"[^a-z]", "", str(value or "").lower())
+    if not key:
+        return default
+    keyed = {re.sub(r"[^a-z]", "", option.lower()): option for option in options}
+    if key in keyed:
+        return keyed[key]
+    for norm, option in keyed.items():
+        if norm and norm in key:
+            return option
+    return default
+
+
+#: Two ledger entries are duplicates only when both the character ratio and the word overlap clear this bar.
+#: The ratio alone is not enough: "The system shall provide invoice export" and "...claim export" score 0.87.
+NEAR_DUPLICATE_RATIO = 0.85
+
+
+def _is_near_duplicate(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # A re-stated requirement whose text contains the existing one verbatim is a duplicate no matter how
+    # much extra prose the model added, so containment is checked before the ratio.
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) >= 20 and shorter in longer:
+        return True
+    if SequenceMatcher(None, a, b, autojunk=False).ratio() < NEAR_DUPLICATE_RATIO:
+        return False
+    words_a, words_b = set(a.split()), set(b.split())
+    union = words_a | words_b
+    return bool(union) and len(words_a & words_b) / len(union) >= NEAR_DUPLICATE_RATIO
 
 
 class _Strict(BaseModel):
@@ -126,6 +168,11 @@ class SubjectSpec(_Strict):
     name: str = Field(description="Short subject title, e.g. 'Scope In and Out'.")
     why: str = Field(default="", description="One sentence on why this subject matters for THIS project.")
     priority: Literal["high", "medium", "low"] = "medium"
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _lenient_priority(cls, value: Any) -> str:
+        return match_canonical(value, ("high", "medium", "low"), "medium")
 
 
 class PlanResult(_Strict):
@@ -257,11 +304,6 @@ class ApprovalResult(_Strict):
 # --------------------------------------------------------------------------- LLM: spec writing
 
 
-class SectionDraft(_Strict):
-    section_id: str = Field(description="The section id you were asked to write, echoed back.")
-    markdown: str = Field(description="Markdown body of the section. No top-level heading, no fenced code wrapper.")
-
-
 class Issue(_Strict):
     section_id: str = Field(default="", description="Section id the issue belongs to (empty for document-wide).")
 
@@ -330,6 +372,11 @@ class DiagramDraft(_Strict):
     diagram_type: Literal["flowchart", "sequenceDiagram", "stateDiagram", "classDiagram"] = "flowchart"
     code: str = Field(description="Mermaid body only (no ``` fences), starting with the diagram keyword.")
     notes: str = ""
+
+    @field_validator("diagram_type", mode="before")
+    @classmethod
+    def _lenient_diagram_type(cls, value: Any) -> str:
+        return match_canonical(value, ("flowchart", "sequenceDiagram", "stateDiagram", "classDiagram"), "flowchart")
 
 
 class DiagramSet(_Strict):
@@ -471,10 +518,6 @@ class SessionState(BaseModel):
                 return question
         return None
 
-    def ledger_lines(self, kind: str | None = None, limit: int = 200) -> list[str]:
-        items = [i for i in self.ledger if kind is None or i.kind == kind]
-        return [i.as_line() for i in items[-limit:]]
-
     def requirements(self) -> list[LedgerItem]:
         return [i for i in self.ledger if i.kind == "requirement"]
 
@@ -496,8 +539,7 @@ class SessionState(BaseModel):
         if len(needle) < 12:
             return False
         for item in self.ledger:
-            existing = _normalise(item.body or item.title)
-            if existing == needle or (len(existing) > 24 and (needle.startswith(existing[:24]) or existing.startswith(needle[:24]))):
+            if _is_near_duplicate(needle, _normalise(item.body or item.title)):
                 return True
         return False
 

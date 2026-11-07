@@ -32,23 +32,21 @@ def _prompts_dir() -> Path:
     directory = Path(cfg.paths.prompts_dir)
     if not directory.is_absolute():
         directory = cfg.root / directory
-    if not directory.exists():  # fall back to templates shipped inside the package
-        directory = Path(__file__).resolve().parent / "prompts"
+    if not directory.exists():  # dev checkout: templates live in the repo-root ``prompts/`` folder
+        directory = Path(__file__).resolve().parents[2] / "prompts"
     return directory
 
 
-def render(name: str, **context) -> tuple[str, dict[str, str]]:
+def render(name: str, **context) -> tuple[str, str]:
     """Render ``<name>`` into ``(system_prompt, user_prompt)``.
 
-    Templates are split with a literal line ``---USER---`` so both halves stay in one readable file.
+    Templates may be split with a literal line ``---USER---`` so both halves stay in one readable file.
+    A template without the marker is entirely the system prompt and the user part is empty: callers such as
+    the chat agent supply the user message themselves, and a generic fallback would discard the persona.
     """
     template = _env().get_template(f"{name}.md.j2")
     text = template.render(**context).strip()
     if "---USER---" in text:
         system_part, _, user_part = text.partition("---USER---")
         return system_part.strip(), user_part.strip()
-    return "You are a helpful assistant.", text.strip()
-
-
-def available_prompts() -> list[str]:
-    return sorted(p.stem.replace(".md", "") for p in _prompts_dir().glob("*.md.j2"))
+    return text, ""
