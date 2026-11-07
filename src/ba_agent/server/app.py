@@ -105,20 +105,20 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     async def health(request: Request) -> dict[str, Any]:
         manager = mgr(request)
         gateway_health = await manager.gateway.health()
-        return {"status": "ok" if gateway_health["reachable"] else "lmstudio_unreachable",
+        return {"status": "ok" if gateway_health["reachable"] else "backend_unreachable",
                 "version": __version__, "gateway": gateway_health,
                 "knowledge": manager.services.knowledge.status(),
                 "config": {"max_questions_per_subject": cfg.interview.max_questions_per_subject,
                            "max_gap_rounds": cfg.interview.max_gap_rounds,
                            "max_review_rounds": cfg.review.max_review_rounds,
-                           "max_concurrency": cfg.lmstudio.max_concurrency}}
+                           "max_concurrency": cfg.active_profile.max_concurrency}}
 
     @app.get("/api/models")
     async def models(request: Request) -> dict[str, Any]:
         manager = mgr(request)
         catalog = await manager.gateway.list_models(refresh=True)
         settings = manager.model_settings()
-        return {"base_url": cfg.lmstudio.base_url, "reachable": bool(catalog),
+        return {"provider": cfg.provider, "base_url": cfg.active_profile.base_url, "reachable": bool(catalog),
                 "chat_models": [m.model_dump() for m in catalog if m.is_chat],
                 "embedding_models": [m.model_dump() for m in catalog if not m.is_chat],
                 "default_model": settings["default_model"], "overrides": settings["overrides"],

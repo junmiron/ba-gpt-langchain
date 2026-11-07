@@ -9,6 +9,9 @@ server:
     - "http://127.0.0.1:8765"
     - "http://localhost:8765"
 
+# Which backend the agents call: lmstudio | strata (local Strata server on the 5090).
+provider: lmstudio
+
 lmstudio:
   base_url: "http://127.0.0.1:1234/v1"     # OpenAI-compatible endpoint
   admin_url: "http://127.0.0.1:1234/api/v0" # used for the model dropdown (load state, context, tool support)
@@ -20,6 +23,17 @@ lmstudio:
   embedding_model: "text-embedding-nomic-embed-text-v1.5"   # must be downloaded/available in LM Studio
   structured_output_method: auto            # auto | json_schema | function_calling | prompt
   max_retries: 2                            # retries per method before falling to the next rung
+
+strata:
+  base_url: "http://127.0.0.1:47831/v1"   # OpenAI-compatible endpoint, no key needed
+  api_key: "strata"                         # placeholder; never a real credential
+  request_timeout_s: 300
+  connect_timeout_s: 10
+  max_concurrency: 1
+  default_model: "q2_0"                     # Qwen3.8-Flash-Next Q2_0
+  embedding_model: null                     # Strata serves no embeddings -> BM25-only retrieval
+  structured_output_method: auto            # q2_0 supports json_schema and tool calling
+  max_retries: 2
 
 # Per-role model + sampling overrides. `model: null` means "use lmstudio.default_model".
 # Tip on small hardware: a fast 8B for interview/triage and a bigger one for writer/use_cases works well.

@@ -284,7 +284,7 @@ class SessionManager:
         silently erase every per-role override the user had saved.
         """
         if default_model is not None:
-            self.config.lmstudio.default_model = default_model or None
+            self.config.active_profile.default_model = default_model or None
             self.services.store.set_setting("default_model", default_model)
         if overrides is not None:
             clean = {k: v for k, v in overrides.items() if v}
@@ -293,15 +293,16 @@ class SessionManager:
                 params.model = clean.get(role) or None
                 self.config.roles[role] = params
             self.services.store.set_setting("model_overrides", clean)
-        return {"default_model": self.config.lmstudio.default_model,
+        return {"default_model": self.config.active_profile.default_model,
                 "overrides": {r: p.model for r, p in self.config.roles.items() if p.model}}
 
     def model_settings(self) -> dict[str, Any]:
         overrides = {role: params.model for role, params in self.config.roles.items() if params.model}
         stored_overrides = self.services.store.get_setting("model_overrides", {}) or {}
-        return {"default_model": self.config.lmstudio.default_model,
+        return {"default_model": self.config.active_profile.default_model,
+                "provider": self.config.provider,
                 "overrides": {**stored_overrides, **overrides},
-                "embedding_model": self.config.lmstudio.embedding_model,
+                "embedding_model": self.config.active_profile.embedding_model,
                 "roles": sorted(self.config.roles.keys())}
 
     async def aclose(self) -> None:

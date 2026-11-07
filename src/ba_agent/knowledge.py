@@ -453,5 +453,5 @@ class KnowledgeService:
             "chunks": len(entries),
             "vector_search": self._matrix is not None,
             "bm25": self._bm25 is not None,
-            "embedding_model": self.config.lmstudio.embedding_model,
+            "embedding_model": self.config.active_profile.embedding_model,
         }

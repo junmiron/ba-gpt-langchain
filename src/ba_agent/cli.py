@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         report = asyncio.run(_doctor(config))
         print(json.dumps(report, indent=2, ensure_ascii=False) if args.json else _format_doctor(report))
-        return 0 if report["lmstudio"]["reachable"] else 1
+        return 0 if report["backend"]["reachable"] else 1
 
     if args.command == "index":
         from .services import Services
@@ -105,7 +105,7 @@ async def _doctor(config) -> dict:
     loaded = [m["id"] for m in models if m.get("state") == "loaded"]
     tool_capable = [m["id"] for m in models if "tool_use" in (m.get("capabilities") or [])]
     return {
-        "lmstudio": {"base_url": config.lmstudio.base_url, "reachable": health["reachable"],
+        "backend": {"provider": config.provider, "base_url": config.active_profile.base_url, "reachable": health["reachable"],
                      "chat_models": len(models), "loaded": loaded, "tool_capable": tool_capable,
                      "default_model": health.get("default_model")},
         "embeddings": {"model": knowledge["embedding_model"], "available": bool(health["embedding_models"]),
@@ -118,14 +118,14 @@ async def _doctor(config) -> dict:
 
 
 def _format_doctor(report: dict) -> str:
-    lm = report["lmstudio"]
+    lm = report["backend"]
     lines = [
-        f"LM Studio      : {'reachable' if lm['reachable'] else 'NOT REACHABLE'} at {lm['base_url']}",
+        f"Backend        : {'reachable' if lm['reachable'] else 'NOT REACHABLE'} ({lm['provider']}) at {lm['base_url']}",
         f"Chat models    : {lm['chat_models']} available, loaded: {', '.join(lm['loaded']) or 'none'}",
         f"Tool calling   : {', '.join(lm['tool_capable']) or 'no model reports tool_use (fine — the workflow does not need it)'}",
         f"Default model  : {lm['default_model'] or '(unset — first loaded chat model will be used)'}",
         f"Embeddings     : {report['embeddings']['model']} "
-        f"({'available' if report['embeddings']['available'] else 'not in LM Studio'}) → "
+        f"({'available' if report['embeddings']['available'] else 'not served by the backend'}) → "
         f"vector search {'on' if report['embeddings']['vector_search_enabled'] else 'off (BM25 only)'}",
         f"Knowledge base : {report['knowledge']['documents']} document(s), {report['knowledge']['chunks']} chunk(s)",
         f"Database       : {report['paths']['db']}",

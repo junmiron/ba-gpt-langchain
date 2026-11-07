@@ -275,7 +275,8 @@ def test_cli_reports_survive_a_legacy_windows_console(monkeypatch):
 
     report = cli._format_doctor(
         {
-            "lmstudio": {
+            "backend": {
+                "provider": "lmstudio",
                 "base_url": "http://127.0.0.1:1234/v1",
                 "reachable": True,
                 "chat_models": 3,

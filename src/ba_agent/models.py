@@ -128,16 +128,22 @@ It must validate against this JSON Schema:
 # --------------------------------------------------------------------------- gateway
 
 #: Shown verbatim in the UI when nothing can be called — it has to say what to do about it.
-NO_MODEL_MESSAGE = (
-    "No LM Studio chat model available. Start LM Studio and load a chat model (or pick one in the model "
-    "dropdown), then press Resume."
-)
+def no_model_message(provider: str) -> str:
+    if provider == "strata":
+        return ("No Strata model reachable. Start the Strata server (q2_0 on the 5090) and press Resume.")
+    return (
+        "No LM Studio chat model available. Start LM Studio and load a chat model (or pick one in the model "
+        "dropdown), then press Resume."
+    )
+
+
+NO_MODEL_MESSAGE = no_model_message("lmstudio")
 
 
 class ModelGateway:
     def __init__(self, config: AppConfig | None = None) -> None:
         self.config = config or get_config()
-        lm = self.config.lmstudio
+        lm = self.config.active_profile
         self._http_timeout = httpx.Timeout(lm.request_timeout_s, connect=lm.connect_timeout_s)
         self._client_kwargs: dict[str, Any] = {
             "api_key": lm.api_key,
@@ -157,29 +163,33 @@ class ModelGateway:
     # -- catalogue ----------------------------------------------------------
 
     async def list_models(self, refresh: bool = False) -> list[ModelInfo]:
-        lm = self.config.lmstudio
+        lm = self.config.active_profile
         now = time.monotonic()
         if not refresh and self._catalog and (now - self._catalog_ts) < 10:
             return self._catalog
 
         models: list[ModelInfo] = []
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
-                resp = await client.get(f"{lm.admin_url}/models")
-                resp.raise_for_status()
-                payload = resp.json()
-            for item in payload.get("data", []):
-                models.append(ModelInfo(
-                    id=item.get("id", ""),
-                    type=item.get("type") or "llm",
-                    state=item.get("state") or "unknown",
-                    capabilities=item.get("capabilities") or [],
-                    max_context_length=item.get("max_context_length"),
-                    loaded_context_length=item.get("loaded_context_length"),
-                    quantization=item.get("quantization"),
-                    publisher=item.get("publisher"),
-                ))
-        except Exception:
+        admin_url = getattr(lm, "admin_url", None)
+        if admin_url:
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+                    resp = await client.get(f"{admin_url}/models")
+                    resp.raise_for_status()
+                    payload = resp.json()
+                for item in payload.get("data", []):
+                    models.append(ModelInfo(
+                        id=item.get("id", ""),
+                        type=item.get("type") or "llm",
+                        state=item.get("state") or "unknown",
+                        capabilities=item.get("capabilities") or [],
+                        max_context_length=item.get("max_context_length"),
+                        loaded_context_length=item.get("loaded_context_length"),
+                        quantization=item.get("quantization"),
+                        publisher=item.get("publisher"),
+                    ))
+            except Exception:
+                models = await self._list_models_openai_compat()
+        else:
             models = await self._list_models_openai_compat()
 
         self._catalog = models
@@ -189,8 +199,8 @@ class ModelGateway:
     async def _list_models_openai_compat(self) -> list[ModelInfo]:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
-                resp = await client.get(f"{self.config.lmstudio.base_url}/models",
-                                        headers={"Authorization": f"Bearer {self.config.lmstudio.api_key}"})
+                resp = await client.get(f"{self.config.active_profile.base_url}/models",
+                                        headers={"Authorization": f"Bearer {self.config.active_profile.api_key}"})
                 resp.raise_for_status()
                 data = resp.json().get("data", [])
         except Exception:
@@ -209,7 +219,8 @@ class ModelGateway:
         default = await self.resolve_model(None)
         return {
             "reachable": bool(models),
-            "base_url": self.config.lmstudio.base_url,
+            "provider": self.config.provider,
+            "base_url": self.config.active_profile.base_url,
             "chat_models": [m.model_dump() for m in chat],
             "embedding_models": [m.model_dump() for m in models if not m.is_chat],
             "loaded": [m.id for m in loaded],
@@ -220,7 +231,7 @@ class ModelGateway:
         """Pick a usable model id: explicit → config default → first loaded chat → first chat."""
         if requested:
             return requested
-        cfg_default = self.config.lmstudio.default_model
+        cfg_default = self.config.active_profile.default_model
         if cfg_default:
             return cfg_default
         models = [m for m in await self.list_models() if m.is_chat]
@@ -241,14 +252,14 @@ class ModelGateway:
 
     def role_model(self, role: str, overrides: dict[str, str] | None = None) -> str | None:
         overrides = overrides or {}
-        return overrides.get(role) or self.config.role(role).model or self.config.lmstudio.default_model
+        return overrides.get(role) or self.config.role(role).model or self.config.active_profile.default_model
 
     def chat(self, model: str | None, *, temperature: float | None = None,
              max_output_tokens: int | None = None, streaming: bool = False) -> ChatOpenAI:
         if not model:
             raise RuntimeError(
-                "No LM Studio model selected and none are loaded. Start a chat model in LM Studio "
-                "(or pick one in the UI dropdown)."
+                f"No chat model available for provider '{self.config.provider}'. Load a model in the "
+                "backend (or pick one in the UI dropdown)."
             )
         key = (model, temperature, max_output_tokens, streaming)
         cached = self._cache.get(key)
@@ -266,7 +277,7 @@ class ModelGateway:
     # -- structured calls ---------------------------------------------------
 
     def _ladder(self, model_id: str | None) -> list[str]:
-        configured = (self.config.lmstudio.structured_output_method or "auto").lower()
+        configured = (self.config.active_profile.structured_output_method or "auto").lower()
         if configured in ("json_schema", "function_calling", "prompt"):
             return [configured]
         ladder = ["json_schema"]
@@ -299,10 +310,11 @@ class ModelGateway:
         # real reason ("LM Studio has no chat model") under nine identical warnings.
         if not model_id:
             self.usage["failures"] += 1
+            msg = no_model_message(self.config.provider)
             await emit(EventType.WARNING, {"step": step, "role": role,
-                                           "message": NO_MODEL_MESSAGE})
+                                           "message": msg})
             return StructuredResult(parsed=None, raw_text="", method="no_model", attempts=0, degraded=True,
-                                    error=NO_MODEL_MESSAGE)
+                                    error=msg)
 
         started = time.perf_counter()
         attempts = 0
@@ -315,7 +327,7 @@ class ModelGateway:
                 messages[0].content = (
                     f"{system_prompt}\n\n{_SCHEMA_INSTRUCTION.format(schema=dumps(schema.model_json_schema()))}"
                 )
-            for attempt in range(1, self.config.lmstudio.max_retries + 2):
+            for attempt in range(1, self.config.active_profile.max_retries + 2):
                 attempts += 1
                 try:
                     async with self._semaphore:
@@ -417,8 +429,9 @@ class ModelGateway:
 
         if not model_id:
             self.usage["failures"] += 1
-            await emit(EventType.WARNING, {"step": step, "role": role, "message": NO_MODEL_MESSAGE})
-            return TextResult(error=NO_MODEL_MESSAGE)
+            msg = no_model_message(self.config.provider)
+            await emit(EventType.WARNING, {"step": step, "role": role, "message": msg})
+            return TextResult(error=msg)
 
         started = time.perf_counter()
         model_ms = 0
@@ -496,19 +509,19 @@ class ModelGateway:
     # -- embeddings ---------------------------------------------------------
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
-        model = self.config.lmstudio.embedding_model
+        model = self.config.active_profile.embedding_model
         if not model or not texts:
             return None
         vectors: list[list[float]] = []
         batch = max(1, self.config.knowledge.embed_batch_size)
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.config.lmstudio.request_timeout_s,
-                                                              connect=self.config.lmstudio.connect_timeout_s)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.config.active_profile.request_timeout_s,
+                                                              connect=self.config.active_profile.connect_timeout_s)) as client:
                 for start in range(0, len(texts), batch):
                     slice_ = list(texts[start : start + batch])
                     resp = await client.post(
-                        f"{self.config.lmstudio.base_url}/embeddings",
-                        headers={"Authorization": f"Bearer {self.config.lmstudio.api_key}"},
+                        f"{self.config.active_profile.base_url}/embeddings",
+                        headers={"Authorization": f"Bearer {self.config.active_profile.api_key}"},
                         json={"model": model, "input": slice_},
                     )
                     resp.raise_for_status()

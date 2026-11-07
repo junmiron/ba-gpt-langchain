@@ -70,6 +70,24 @@ class LMStudioConfig(BaseModel):
         return v.rstrip("/")
 
 
+class StrataConfig(BaseModel):
+    base_url: str = "http://127.0.0.1:47831/v1"   # local Strata server (no key required)
+    api_key: str = "strata"                       # placeholder; never a real credential
+    request_timeout_s: float = 300.0
+    connect_timeout_s: float = 10.0
+    max_concurrency: int = 1
+    default_model: str | None = "q2_0"
+    embedding_model: str | None = None            # no embeddings served -> BM25-only retrieval
+    # auto | json_schema | function_calling | prompt
+    structured_output_method: str = "auto"
+    max_retries: int = 2
+
+    @field_validator("base_url")
+    @classmethod
+    def _strip_slash(cls, v: str) -> str:
+        return v.rstrip("/")
+
+
 class RoleParams(BaseModel):
     model: str | None = None
     temperature: float = 0.4
@@ -141,7 +159,10 @@ class PathsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
+    # Which backend the agents talk to: lmstudio | strata
+    provider: str = "lmstudio"
     lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
+    strata: StrataConfig = Field(default_factory=StrataConfig)
     roles: dict[str, RoleParams] = Field(default_factory=_default_roles)
     interview: InterviewConfig = Field(default_factory=InterviewConfig)
     review: ReviewConfig = Field(default_factory=ReviewConfig)
@@ -151,6 +172,19 @@ class AppConfig(BaseModel):
     root: Path = PROJECT_ROOT
 
     # -- helpers -------------------------------------------------------------
+
+    @field_validator("provider")
+    @classmethod
+    def _known_provider(cls, v: str) -> str:
+        v = (v or "lmstudio").strip().lower()
+        if v not in ("lmstudio", "strata"):
+            raise ValueError(f"provider must be 'lmstudio' or 'strata', got {v!r}")
+        return v
+
+    @property
+    def active_profile(self) -> LMStudioConfig | StrataConfig:
+        """The model profile the gateway actually uses."""
+        return self.strata if self.provider == "strata" else self.lmstudio
 
     def role(self, name: str) -> RoleParams:
         return self.roles.get(name) or RoleParams()
@@ -196,6 +230,9 @@ _ENV_MAP = {
     "BA_STRUCTURED_METHOD": ("lmstudio", "structured_output_method", str),
     "BA_MAX_CONCURRENCY": ("lmstudio", "max_concurrency", int),
     "BA_REQUEST_TIMEOUT_S": ("lmstudio", "request_timeout_s", float),
+    "BA_PROVIDER": (None, "provider", str),
+    "STRATA_BASE_URL": ("strata", "base_url", str),
+    "STRATA_MODEL": ("strata", "default_model", str),
     "BA_MAX_QUESTIONS_PER_SUBJECT": ("interview", "max_questions_per_subject", int),
     "BA_MAX_GAP_ROUNDS": ("interview", "max_gap_rounds", int),
     "BA_MAX_SUMMARY_REJECTIONS": ("interview", "max_summary_rejections", int),
@@ -242,7 +279,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             cast_value = caster(value)
         except (TypeError, ValueError):
             continue
-        section_obj = getattr(cfg, section)
+        section_obj = cfg if section is None else getattr(cfg, section)
         setattr(section_obj, field_name, cast_value)
 
     cfg.ensure_dirs()
