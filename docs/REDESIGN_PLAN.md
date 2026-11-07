@@ -75,7 +75,7 @@ Versions: `langchain 1.4.6` (2026-10-14), `langchain-core 1.7.0`, `langgraph 1.2
 
 | Technology | Verdict | Why |
 |---|---|---|
-| `create_agent` + **middleware** | **Adopt** | The standard agent loop (replaces the hand-rolled `bind_tools`+`astream` loop). Hooks: `before_agent`, `before_model`, `wrap_model_call`, `wrap_tool_call`, `after_model`, `after_agent`. Built-ins: `SummarizationMiddleware`, `PIIMiddleware`, `HumanInTheLoopMiddleware`; budget/termination guardrails become custom middleware instead of ad-hoc counters inside the loop. |
+| `create_agent` + **middleware** | **Skip** (needs LangGraph runtime — see Part 6.1) | The standard agent loop (replaces the hand-rolled `bind_tools`+`astream` loop). Hooks: `before_agent`, `before_model`, `wrap_model_call`, `wrap_tool_call`, `after_model`, `after_agent`. Built-ins: `SummarizationMiddleware`, `PIIMiddleware`, `HumanInTheLoopMiddleware`; budget/termination guardrails become custom middleware instead of ad-hoc counters inside the loop. |
 | **Model profiles + structured-output strategies** (`ProviderStrategy` / `ToolStrategy`, auto-selected from capability data, `langchain>=1.1`) | **Adopt, keep the ladder** | LM Studio's OpenAI-compatible server *does* support `response_format: {"type":"json_schema"}` for capable models (LM Studio docs). LangChain 1.x detects capability per model; the prompt+repair rung stays as the final fallback for weak local models. |
 | **LangGraph** (checkpointers, `interrupt()` / `Command(resume)`, stores, durable execution) | **Decision point** (see Part 3.4) | It is the runtime `create_agent` already compiles to. Its killer features map exactly onto hand-rolled code: step-level durable resume (checkpointer), human question cards (`interrupt()`), cross-session memory (`store`). |
 | `langchain[mcp]` (`MCPAdapter`, beta since 1.4) | **Adopt, behind a flag** | Lets the writer/critic call the *same* MCP servers the sibling repo built (Mermaid render, spec formatting). Beta API — isolate behind an optional module. |
@@ -106,9 +106,9 @@ src/ba_agent/
     model.py               # ModelGateway over ChatOpenAI(LM Studio), profiles, semaphore
     structured.py          # strategy selection: json_schema → tools → prompt+repair
   agents/
-    writer_agent.py        # create_agent + tools(search_knowledge, read_artifact) + budget middleware
-    critic_agent.py        # create_agent + read-only tools
-    chat_agent.py          # create_agent + SummarizationMiddleware + session-context middleware
+    writer_agent.py        # RunnableSequence + tools(search_knowledge, read_artifact) + budget runnable
+    critic_agent.py        # RunnableSequence + read-only tools
+    chat_agent.py          # existing tool loop + context-trimming runnable + session-context middleware
   workflow/
     engine.py              # phase machine (kept; or LangGraph-backed, see 3.4)
     budgets.py             # all caps in one place
@@ -182,20 +182,24 @@ Phase 4 (LangGraph engine) is **dropped** from the plan.
 
 # Part 4 — Step-by-step implementation plan
 
-**Phase 0 — Stabilize (≈ 1–2 days).** No architecture change.
+**Phase 0 — Stabilize (≈ 1–2 days).** No architecture change. **DONE 2026-11-07** — commits `c71db05`…`b55afa8`; suite went 58 → 167 tests, all green, offline.
 1. Fix R1–R12 and S1–S3 (typed events; SSE cursor precedence + looped replay; delete `_chat_step` or implement it; truncation keeps lint blockers; lenient validators; unified thresholds in config).
 2. Upload: cap stream-wise, extension allowlist, hash dedup; SSRF guard; CSP + sanitize SVG; CSRF origin check.
 3. Remove dead code; add `schema_version` + retention for `events`.
 4. GitHub Actions CI (pytest 3.11/3.13, ruff, UI static check).
 *Acceptance:* existing 58 tests + new regression tests for every fix, CI green.
 
-**Phase 1 — LangChain 1.x idioms (≈ 2–4 days).**
-1. Deps: `langchain>=1.4`, `langgraph` (runtime of `create_agent`), `langchain-text-splitters`.
-2. Replace `AgentLoop` with `create_agent` + custom budget middleware (the loop's termination rules move into middleware hooks).
-3. Structured output via model profiles (`ProviderStrategy` when LM Studio advertises json_schema; `ToolStrategy` otherwise; repair ladder as last rung).
-4. Writer/critic become agents with `search_knowledge` + `read_artifact` tools; chat becomes `create_agent` + `SummarizationMiddleware`.
-5. Prompt-context contract: per-template typed context model + a test that extracts undeclared Jinja variables per template.
-*Acceptance:* offline scripted-gateway e2e produces the same 6 artifacts; new middleware tests; no phase-behavior regressions.
+**Phase 1 — LangChain 1.x idioms, core-only (≈ 2–4 days).**
+1. Deps: bump `langchain-core>=1.7`, add `langchain-text-splitters`. No `langgraph`, no `langchain.agents.create_agent`
+   (it compiles to LangGraph — see Part 6.1).
+2. `AgentLoop` stays a hand-rolled loop but is refactored into `RunnableSequence[SystemPrompt | ContextMiddleware |
+   Model | ToolExecutor]` composition so budget/termination rules become reusable runnables instead of counters.
+3. Structured output via model profiles: each profile declares its rung order (LM Studio: json_schema if the model
+   advertises it, then function calling, then prompt+repair; Strata: json_schema — verified live on q2_0).
+4. Knowledge access becomes a `Retriever` subclass so writer/critic/chat share one interface; chunking moves to
+   `RecursiveCharacterTextSplitter` with heading-aware separators.
+5. Prompt-context contract: per-template typed context model + a test extracting undeclared Jinja variables.
+*Acceptance:* the 167-test suite stays green offline; new runnable/retriever tests; artifact output unchanged.
 
 **Phase 2 — Deliverables (≈ 3–5 days).** *(updated by the bake-off: generate Typst directly, skip pandoc)*
 1. Vendor `typst.exe` + fonts (same binaries the sibling repo already ships, ~10 MB).
@@ -234,7 +238,15 @@ Phase 4 (LangGraph engine) is **dropped** from the plan.
 
 # Part 6 — Open decisions for approval
 
-1. ~~LangGraph~~ — **decided: A (idioms only, no LangGraph imports)**.
+1. ~~LangGraph~~ — **decided: A (idioms only, no LangGraph imports)**. Consequence: `create_agent` is also
+   out, because in LangChain 1.x it compiles to a LangGraph under the hood. Phase 1 keeps the deterministic
+   engine and the hand-rolled tool loop (already pure `langchain-core`), and adopts core-only idioms:
+   `RunnableSequence`, per-profile structured-output strategies, `langchain-text-splitters`, typed prompt contexts.
+2. ~~PDF engine~~ — **decided: Typst-native** (hand-generated `.typ`, vendored `typst.exe`, ReportLab fallback).
+3. ~~Transcript ingestion~~ — **decided: yes, Phase 3**.
+4. ~~Security~~ — **decided: localhost hardening only** (done in Phase 0: CSRF origin check, CORS fix, SSRF
+   guard, upload caps + dedup, CSP + SVG sanitising). Token auth deferred to Phase 5 if ever exposed.
+5. ~~Order~~ — **decided: stabilize first** (Phase 0 shipped; Phase 2 before Phase 4-scale work).
 2. PDF engine: Typst-native (bake-off winner) vs ReportLab-only (no vendored binaries)?
 3. Transcript ingestion: add or skip?
 4. Security scope: localhost-only hardening vs token-auth for LAN use?
