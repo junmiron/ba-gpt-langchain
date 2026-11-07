@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,29 @@ from ..spec import spec_stats
 from ..tools.sandbox import SandboxError
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+#: One inline ``<svg>…</svg>`` block inside a served deliverable (non-greedy, case-insensitive, spans lines).
+_SVG_BLOCK_RE = re.compile(r"<svg\b.*?</svg\s*>", re.IGNORECASE | re.DOTALL)
+
+#: Events per keyset page when replaying a backlog over SSE/REST.
+REPLAY_PAGE_SIZE = 1000
+#: Hard cap on one upload request body and on one file within it.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+#: Largest number of files accepted in one upload request.
+MAX_UPLOAD_FILES = 20
+#: Content-Security-Policy for the served deliverable: same-origin resources only, no script from anywhere but the
+#: page itself (its own inline script is needed for the Markdown view), no plugins, no framing, no form posts.
+DELIVERABLE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                   "img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; "
+                   "frame-ancestors 'none'")
+
+
+def _parse_cursor(value: Any) -> int:
+    """A non-negative integer event cursor; anything else (missing, garbage, negative) means 'from the start'."""
+    try:
+        return max(0, int(str(value).strip())) if value not in (None, "") else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 # --------------------------------------------------------------------------- request models
@@ -92,12 +116,34 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await manager.aclose()
 
     app = FastAPI(title="BA Agent (LangChain)", version=__version__, lifespan=lifespan)
-    if cfg.server.cors_origins and "*" not in cfg.server.cors_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=cfg.server.cors_origins, allow_credentials=True,
+    # CORS: allow only the explicitly configured origins. A wildcard is *not* honoured as "allow all" here — the
+    # app is local-first and a credentialed wildcard would let any web page read the API. Cross-origin
+    # state-changing requests are rejected separately by _require_same_origin (CSRF).
+    cors_origins = [o for o in cfg.server.cors_origins if o != "*"]
+    if cors_origins:
+        app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True,
                            allow_methods=["*"], allow_headers=["*"])
 
     def mgr(request: Request) -> SessionManager:
         return request.app.state.manager  # type: ignore[return-value]
+
+    def _require_same_origin(request: Request) -> None:
+        """Refuse state-changing requests whose ``Origin`` is not this server (CSRF defence, localhost-only).
+
+        Browsers send ``Origin`` on cross-site form posts and fetches. Requests without an Origin (curl, the
+        test client, same-origin GETs) are not browser CSRF, so they pass.
+        """
+        origin = request.headers.get("origin")
+        if origin is None:
+            return
+        if origin not in _allowed_origins(request):
+            raise HTTPException(status_code=403, detail="cross-origin request refused")
+
+    def _allowed_origins(request: Request) -> set[str]:
+        host = request.headers.get("host", "")
+        allowed = {f"http://{host}", f"https://{host}"} if host else set()
+        allowed.update(cors_origins)
+        return allowed
 
     # -- meta ---------------------------------------------------------------
 
@@ -126,6 +172,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/models")
     async def set_models(request: Request, payload: ModelsRequest = Body(...)) -> dict[str, Any]:
+        _require_same_origin(request)
         return await mgr(request).set_models(payload.default_model, payload.overrides)
 
     # -- sessions -----------------------------------------------------------
@@ -136,6 +183,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/sessions")
     async def create_session(request: Request, payload: CreateSessionRequest) -> dict[str, Any]:
+        _require_same_origin(request)
         manager = mgr(request)
         indexed = None
         if payload.urls:
@@ -154,11 +202,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(request: Request, session_id: str) -> dict[str, Any]:
+        _require_same_origin(request)
         await mgr(request).delete_session(session_id)
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/answer")
     async def answer(request: Request, session_id: str, payload: AnswerRequest) -> dict[str, Any]:
+        _require_same_origin(request)
         try:
             return await mgr(request).answer(session_id, payload.question_id, answer=payload.answer,
                                              skipped=payload.skipped, not_applicable=payload.not_applicable)
@@ -169,6 +219,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/approve")
     async def approve(request: Request, session_id: str, payload: ApproveRequest) -> dict[str, Any]:
+        _require_same_origin(request)
         try:
             return await mgr(request).approve(session_id, payload.approved, payload.notes)
         except KeyError as exc:
@@ -178,6 +229,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/resume")
     async def resume(request: Request, session_id: str) -> dict[str, Any]:
+        _require_same_origin(request)
         try:
             return await mgr(request).resume(session_id)
         except KeyError as exc:
@@ -185,11 +237,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/cancel")
     async def cancel(request: Request, session_id: str) -> dict[str, Any]:
+        _require_same_origin(request)
         stopped = await mgr(request).cancel(session_id)
         return {"ok": True, "stopped": stopped}
 
     @app.post("/api/sessions/{session_id}/chat")
     async def chat(request: Request, session_id: str, payload: ChatRequest) -> dict[str, Any]:
+        _require_same_origin(request)
         try:
             return await mgr(request).chat(session_id, payload.message)
         except KeyError as exc:
@@ -207,14 +261,23 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         if manager.get_state(session_id) is None:
             raise HTTPException(status_code=404, detail="unknown session")
 
-        header_cursor = request.headers.get("last-event-id")
-        start_after = after if after is not None else int(header_cursor or 0)
+        # Resume point. The browser's EventSource sends Last-Event-ID automatically on reconnect; the UI also
+        # puts a ``?after=`` on the URL, which can be stale. Honour whichever cursor is further ahead so neither
+        # a stale query string nor a missing header causes events to be re-sent or skipped.
+        start_after = max(_parse_cursor(after), _parse_cursor(request.headers.get("last-event-id")))
         queue = manager.fanout.subscribe(session_id)
 
         async def generator() -> AsyncIterator[str]:
             try:
-                for event in manager.events_after(session_id, after_id=start_after, limit=1500):
-                    yield _sse(event)
+                cursor = start_after
+                while True:
+                    # Keyset pages: a backlog of any size is replayed in order without silent truncation.
+                    page = manager.events_after(session_id, after_id=cursor, limit=REPLAY_PAGE_SIZE)
+                    for event in page:
+                        yield _sse(event)
+                    if len(page) < REPLAY_PAGE_SIZE:
+                        break
+                    cursor = int(page[-1]["id"])
                 while True:
                     if await request.is_disconnected():
                         break
@@ -238,6 +301,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @app.post("/api/knowledge/index")
     async def knowledge_index(request: Request, payload: IndexRequest) -> dict[str, Any]:
+        _require_same_origin(request)
         service = mgr(request).services.knowledge
         result: dict[str, Any] = {}
         if payload.directory or not payload.urls:
@@ -247,19 +311,27 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         return result
 
     @app.post("/api/knowledge/upload")
-    async def knowledge_upload(request: Request, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    async def knowledge_upload(request: Request) -> dict[str, Any]:
+        """Multipart upload. The body is read in chunks and rejected with 413 as soon as it exceeds the cap, so an
+        oversized request never has to fit in memory. Each file is then validated by the knowledge service."""
+        _require_same_origin(request)
         service = mgr(request).services.knowledge
+        content_type = request.headers.get("content-type", "")
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES + 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"upload larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+        if "multipart/form-data" not in content_type:
+            raise HTTPException(status_code=415, detail="expected multipart/form-data")
+
+        files = await _read_capped_uploads(request)
         outcomes = []
-        for upload in files:
-            data = await upload.read()
-            if len(data) > 25 * 1024 * 1024:
-                outcomes.append({"ok": False, "name": upload.filename, "error": "file larger than 25 MB"})
-                continue
-            outcomes.append({"name": upload.filename, **(await service.index_upload(upload.filename or "upload.txt", data))})
+        for name, data in files:
+            outcomes.append({"name": name, **(await service.index_upload(name or "upload.txt", data))})
         return {"results": outcomes, "status": service.status()}
 
     @app.post("/api/knowledge/search")
     async def knowledge_search(request: Request, payload: dict = Body(...)) -> list[dict[str, Any]]:
+        _require_same_origin(request)
         query = str(payload.get("query", ""))
         results = await mgr(request).services.knowledge.search(query, k=int(payload.get("k", 5)))
         return [{"source": r.source, "title": r.title, "score": round(r.score, 4), "text": r.text[:600]}
@@ -268,7 +340,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # -- artifacts ----------------------------------------------------------
 
     @app.get("/api/artifacts/{session_id}/{name}")
-    async def artifact(request: Request, session_id: str, name: str) -> FileResponse:
+    async def artifact(request: Request, session_id: str, name: str) -> Response:
         manager = mgr(request)
         if ".." in session_id or "\\" in session_id or "/" in session_id:
             raise HTTPException(status_code=400, detail="invalid session id")
@@ -280,7 +352,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         if not path.exists() or not path.is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
-        return FileResponse(path, filename=path.name)
+        response: Response = FileResponse(path, filename=path.name)
+        if path.suffix.lower() in (".html", ".htm"):
+            # The deliverable runs model-influenced markup on the app's own origin: sanitise the embedded SVG and
+            # lock the document down with a CSP, so even a missed payload cannot execute.
+            body = path.read_text(encoding="utf-8", errors="replace")
+            body = _sanitize_inline_svg(body)
+            response = HTMLResponse(content=body)
+            response.headers["Content-Security-Policy"] = DELIVERABLE_CSP
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     # -- UI -----------------------------------------------------------------
 
@@ -292,6 +374,59 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             return JSONResponse({"detail": f"web UI not found at {WEB_DIR}"}, status_code=404)
 
     return app
+
+
+async def _read_capped_uploads(request: Request) -> list[tuple[str, bytes]]:
+    """Parse a multipart body, stopping with 413 as soon as the running total exceeds the cap.
+
+    Starlette's ``UploadFile`` would spool the whole request before any check runs; this consumes the raw body
+    chunk by chunk and aborts early, so a hostile client can never make the server hold more than
+    ``MAX_UPLOAD_BYTES`` (plus one chunk) of upload data. Returns ``(filename, bytes)`` per file part.
+    """
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+    from starlette.formparsers import MultiPartParser
+
+    received = 0
+
+    async def capped_stream():
+        nonlocal received
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > MAX_UPLOAD_BYTES + 1024 * 1024:  # +1 MB multipart overhead allowance
+                raise HTTPException(status_code=413, detail=f"upload larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+            yield chunk
+
+    parser = MultiPartParser(request.headers, capped_stream())
+    try:
+        form = await parser.parse()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — malformed multipart is a client error, not a crash
+        raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
+
+    files: list[tuple[str, bytes]] = []
+    for _, value in form.multi_items():
+        if not isinstance(value, StarletteUploadFile) or value.filename is None:
+            continue
+        if len(files) >= MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=413, detail=f"at most {MAX_UPLOAD_FILES} files per upload")
+        data = await value.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"file larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+        files.append((value.filename, data))
+    if not files:
+        raise HTTPException(status_code=400, detail="no files in upload")
+    return files
+
+
+def _sanitize_inline_svg(html_text: str) -> str:
+    """Replace each ``<svg>...</svg>`` block in a served deliverable with its sanitised form (or remove it)."""
+    from ..sanitize import sanitize_svg
+
+    def _swap(match: re.Match[str]) -> str:
+        return sanitize_svg(match.group(0))
+
+    return _SVG_BLOCK_RE.sub(_swap, html_text)
 
 
 def _sse(event: dict[str, Any]) -> str:

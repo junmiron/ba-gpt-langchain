@@ -52,18 +52,21 @@ class SessionManager:
     # ------------------------------------------------------------------ lifecycle
 
     def mark_interrupted(self) -> int:
-        """Called on startup: a run interrupted by a restart is resumable, not silently 'running'."""
+        """Called on startup: a run interrupted by a restart is resumable, not silently 'running'.
+
+        Scans every session in the database, not a page of the most recent ones, so an old interrupted run is
+        still marked resumable.
+        """
         count = 0
-        for row in self.services.store.list_sessions(limit=500):
-            if row["status"] == RunStatus.RUNNING.value:
-                state = self.services.store.load_state(row["id"])
-                if state is None:
-                    continue
-                state.status = RunStatus.IDLE
-                self.services.store.save_state(state)
-                self.log_event(state.session_id, EventType.WARNING, {
-                    "message": "run was interrupted by a server restart — press Resume to continue"})
-                count += 1
+        for session_id in self.services.store.session_ids_with_status(RunStatus.RUNNING.value):
+            state = self.services.store.load_state(session_id)
+            if state is None:
+                continue
+            state.status = RunStatus.IDLE
+            self.services.store.save_state(state)
+            self.log_event(state.session_id, EventType.WARNING, {
+                "message": "run was interrupted by a server restart — press Resume to continue"})
+            count += 1
         return count
 
     async def create_session(self, brief: str, title: str = "", model_overrides: dict[str, str] | None = None,
@@ -147,12 +150,13 @@ class SessionManager:
 
     async def _run(self, runtime: SessionRuntime, reason: str, **kwargs: Any) -> None:
         emit = self.emitter(runtime.session_id)
+        if reason == "chat":
+            # Deliberately outside runtime.lock: the chat tools call mutate(), which takes that same lock.
+            await self._run_chat(runtime, str(kwargs.get("message", "")), emit)
+            return
         async with runtime.lock:
             state = runtime.state
             try:
-                if reason == "chat":
-                    await self._chat_step(state, str(kwargs.get("message", "")), emit)
-                    return
                 if reason in ("answer",):
                     await self.engine.submit_answer(
                         state, int(kwargs["question_id"]), answer=kwargs.get("answer"),
@@ -175,6 +179,16 @@ class SessionManager:
                 state.status = RunStatus.ERROR
                 self.services.store.save_state(state)
                 await emit(EventType.ERROR, {"message": state.error, "reason": reason})
+
+    async def _run_chat(self, runtime: SessionRuntime, message: str, emit) -> None:
+        """Background chat turn; a failure is reported in the event stream and never fails the session run."""
+        try:
+            await self._chat_step(runtime.state, message, emit)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await emit(EventType.ERROR, {"message": f"chat failed: {type(exc).__name__}: {exc}", "reason": "chat"})
+
 
     async def cancel(self, session_id: str) -> bool:
         runtime = self.runtimes.get(session_id)
@@ -238,9 +252,18 @@ class SessionManager:
         return message
 
     async def chat(self, session_id: str, message: str) -> dict[str, Any]:
-        """Interactive Q&A with the BA while a run is in flight (tool-calling agent loop)."""
+        """Interactive Q&A with the BA while a run is in flight (tool-calling agent loop). Returns the reply."""
         runtime = self._runtime(session_id)
-        emit = self.emitter(session_id)
+        return await self._chat_step(runtime.state, message, self.emitter(session_id))
+
+    async def _chat_step(self, state: SessionState, message: str, emit) -> dict[str, Any]:
+        """One chat turn: build the tool-using agent for this session, run it, and persist the outcome.
+
+        Tools mutate the session through :meth:`mutate`, which takes ``runtime.lock``; callers must therefore not
+        hold that lock when invoking this method.
+        """
+        session_id = state.session_id
+        runtime = self._runtime(session_id)
 
         async def mutate(apply_state):
             async with runtime.lock:
@@ -248,7 +271,6 @@ class SessionManager:
                 self.services.store.save_state(runtime.state)
             return result
 
-        state = runtime.state
         ctx = ChatContext(session_id=session_id, get_state=lambda: runtime.state, mutate=mutate,
                           knowledge=self.services.knowledge, sandbox=self.services.sandbox,
                           store=self.services.store)

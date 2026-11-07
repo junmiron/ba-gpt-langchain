@@ -44,16 +44,24 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+#: Default live buffer per subscriber. Large enough that a whole review round never overflows a healthy tab.
+DEFAULT_FANOUT_CAPACITY = 5000
+
+
 class EventFanout:
     """Per-session in-process pub/sub used by the SSE endpoint.
 
     Events are also persisted (see :mod:`ba_agent.store`), so a reconnecting client can replay
     from its last id; this class only handles live delivery.
+
+    When a subscriber falls behind and its buffer overflows, the oldest frames are dropped (the engine never
+    blocks). The drop is *not* silent: the subscriber receives a ``warning`` event with the number of frames lost,
+    so the UI can tell the user to reload and replay from the event log.
     """
 
-    def __init__(self, maxlen: int = 500) -> None:
+    def __init__(self, maxlen: int = DEFAULT_FANOUT_CAPACITY) -> None:
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
-        self._maxlen = maxlen
+        self._maxlen = max(4, int(maxlen))
 
     def subscribe(self, session_id: str) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._maxlen)
@@ -72,9 +80,24 @@ class EventFanout:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                # Slow consumer: drop the oldest frame, never block the engine.
-                try:
-                    queue.get_nowait()
-                    queue.put_nowait(event)
-                except Exception:
-                    pass
+                self._make_room(session_id, queue, event)
+
+    def _make_room(self, session_id: str, queue: asyncio.Queue, event: dict[str, Any]) -> None:
+        """Slow consumer: drop the oldest frames (never block the engine) and report the loss in-band."""
+        dropped = 0
+        for _ in range(2):  # one slot for the warning, one for the event itself
+            try:
+                queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:  # pragma: no cover - defensive
+                break
+        warning = {
+            "id": 0, "session_id": session_id, "ts": now_iso(), "type": EventType.WARNING, "role": "", "step": "",
+            "payload": {"message": f"live stream fell behind and dropped {dropped} event(s); reload the page to "
+                                   "replay the full history", "dropped": dropped, "source": "fanout"},
+        }
+        for item in (warning, event):
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:  # pragma: no cover - two slots were just freed
+                pass

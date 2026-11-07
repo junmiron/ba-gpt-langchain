@@ -11,12 +11,13 @@ Differences from v1's ``rag_helpers.py``:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import httpx
 from lxml import html as lxml_html
@@ -28,6 +29,14 @@ from .store import Store, sha256_text
 TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".csv", ".json", ".yaml", ".yml"}
 PDF_SUFFIXES = {".pdf"}
 DOCX_SUFFIXES = {".docx", ".doc"}
+
+#: Extensions accepted by uploads (anything else is rejected before its bytes are written to disk).
+ALLOWED_UPLOAD_SUFFIXES = TEXT_SUFFIXES | PDF_SUFFIXES | DOCX_SUFFIXES
+#: Hard cap for one uploaded file (the HTTP layer enforces the same limit on the whole request body).
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+#: Hard cap for one fetched web page body.
+MAX_FETCH_BYTES = 10 * 1024 * 1024
+MAX_REDIRECTS = 5
 
 
 # --------------------------------------------------------------------------- chunking
@@ -181,15 +190,102 @@ def extract_main_content(html: str, url: str = "") -> tuple[str, str]:
     return title, re.sub(r"\s{2,}", " ", chosen).strip()
 
 
-async def fetch_url(url: str, timeout: float = 30.0) -> tuple[str, str]:
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+class UnsafeURLError(ValueError):
+    """Raised when a URL would reach a non-public host or uses a non-http scheme (SSRF guard)."""
+
+
+def _is_public_ip(address: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])  # drop IPv6 zone ids
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved
+                or ip.is_unspecified)
+
+
+def _resolve_host(host: str) -> list[str]:
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise UnsafeURLError(f"host '{host}' does not resolve: {exc}") from exc
+    return [str(info[4][0]) for info in infos]
+
+
+def check_fetch_url(url: str, resolver: Callable[[str], list[str]] = _resolve_host) -> None:
+    """Reject anything that is not a plain http(s) URL to a public host. Raises :class:`UnsafeURLError`.
+
+    Every resolved address must be public, so a name that maps to both a public and a private address is refused.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url or "")
+    if parts.scheme not in ("http", "https"):
+        raise UnsafeURLError(f"only http and https URLs can be fetched (got '{parts.scheme or 'none'}')")
+    host = (parts.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        raise UnsafeURLError("URL has no host")
+    if host == "localhost" or host.endswith(".localhost"):
+        raise UnsafeURLError(f"host '{host}' is loopback")
+    addresses = [host] if _looks_like_ip(host) else resolver(host)
+    if not addresses:
+        raise UnsafeURLError(f"host '{host}' has no addresses")
+    for address in addresses:
+        if not _is_public_ip(address):
+            raise UnsafeURLError(f"host '{host}' resolves to a non-public address ({address})")
+
+
+def _looks_like_ip(host: str) -> bool:
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
+async def fetch_url(url: str, timeout: float = 30.0, *, max_bytes: int = MAX_FETCH_BYTES,
+                    resolver: Callable[[str], list[str]] = _resolve_host) -> tuple[str, str]:
+    """Fetch a public web page and return ``(title, text)``.
+
+    SSRF guard: the initial URL and every redirect target are checked by :func:`check_fetch_url`, and the body is
+    streamed with a hard size cap so an oversized response is never fully read into memory.
+    """
+    current = url
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
                                  headers={"User-Agent": "ba-agent/0.1 (+local research tool)"}) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-    if "html" not in content_type and "<html" not in response.text[:500].lower():
-        return url, response.text.strip()
-    return extract_main_content(response.text, url)
+        for _ in range(MAX_REDIRECTS + 1):
+            check_fetch_url(current, resolver)
+            async with client.stream("GET", current) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location", "")
+                    if not location:
+                        raise UnsafeURLError("redirect without a Location header")
+                    current = str(response.url.join(location))
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        raise UnsafeURLError(f"response larger than {max_bytes // (1024 * 1024)} MB")
+                encoding = response.encoding or "utf-8"
+                text = bytes(body).decode(encoding, errors="replace")
+                break
+        else:
+            raise UnsafeURLError(f"more than {MAX_REDIRECTS} redirects")
+
+    if "html" not in content_type and "<html" not in text[:500].lower():
+        return url, text.strip()
+    return extract_main_content(text, url)
+
 
 
 # --------------------------------------------------------------------------- retrieval
@@ -293,6 +389,22 @@ class KnowledgeService:
         return result
 
     async def index_upload(self, filename: str, data: bytes) -> dict[str, Any]:
+        """Validate, dedupe by content hash, then store one uploaded file in the knowledge folder."""
+        if len(data) > MAX_UPLOAD_BYTES:
+            return {"ok": False, "error": f"file larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"}
+        suffix = Path(filename or "").suffix.lower()
+        if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+            allowed = ", ".join(sorted(ALLOWED_UPLOAD_SUFFIXES))
+            return {"ok": False, "error": f"file type '{suffix or 'none'}' is not allowed (allowed: {allowed})"}
+
+        # Dedup on the content, before anything is written: the same bytes uploaded twice (under any name) must
+        # not create a second knowledge-base entry. Digest on the raw bytes so it is cheap and format-agnostic.
+        digest = hashlib.sha256(data).hexdigest()
+        existing = self.store.kb_find_doc_by_digest(digest)
+        if existing is not None:
+            return {"ok": True, "duplicate": True, "path": existing.get("uri", ""), "embedded": None,
+                    "existing_title": existing.get("title", "")}
+
         target_dir = self.config.root / self.config.knowledge.docs_dir
         target_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).name) or "upload.txt"
@@ -308,9 +420,10 @@ class KnowledgeService:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "path": str(path)}
         outcome = await self._store_document(source="file", uri=str(path), title=safe_name, text=raw,
-                                             key_digest=sha256_text(raw))
+                                             key_digest=digest)
         self.invalidate()
         return {"ok": True, "path": str(path), "embedded": outcome}
+
 
     async def _store_document(self, *, source: str, uri: str, title: str, text: str, key_digest: str) -> bool:
         cfg = self.config.knowledge
