@@ -647,20 +647,21 @@ async function loadModels() {
     data = await api("/api/models");
   } catch (error) {
     $("#health-dot").className = "dot dot-off";
-    $("#health-text").textContent = "LM Studio: unreachable";
+    $("#health-text").textContent = (S.provider || "LM Studio") + ": unreachable";
     return;
   }
   S.models = data.chat_models || [];
   S.defaultModel = data.default_model;
   S.overrides = data.overrides || {};
   S.embeddingModel = data.embedding_model;
+  S.provider = data.provider || "LM Studio";
 
   const healthy = (data.chat_models || []).length > 0;
   $("#health-dot").className = "dot " + (healthy ? "dot-on" : "dot-off");
   const loaded = (data.chat_models || []).filter((m) => m.state === "loaded").map((m) => m.id);
   $("#health-text").textContent = healthy
-    ? `LM Studio · ${data.chat_models.length} model(s), ${loaded.length} loaded`
-    : "LM Studio: no models found";
+    ? `${data.provider || "LM Studio"} · ${data.chat_models.length} model(s), ${loaded.length} loaded`
+    : (data.provider || "LM Studio") + ": no models found";
 
   fillModelSelect($("#model-select"), S.defaultModel, true);
   fillModelSelect($("#new-model"), S.defaultModel, true);

@@ -19,7 +19,7 @@
       <span class="brand-mark">BA</span>
       <div>
         <div class="brand-title">Requirements Agent</div>
-        <div class="brand-sub">LangChain · LM Studio</div>
+        <div class="brand-sub">LangChain · local models</div>
       </div>
     </div>
 
@@ -41,7 +41,7 @@
     </div>
 
     <div class="side-footer">
-      <span id="health-dot" class="dot dot-off"></span><span id="health-text">LM Studio: checking…</span>
+      <span id="health-dot" class="dot dot-off"></span><span id="health-text">backend: checking…</span>
     </div>
   </aside>
 
@@ -55,7 +55,7 @@
       <div class="controls">
         <label class="model-picker">
           <span class="ctl-label">Model</span>
-          <select id="model-select" title="LM Studio model used for the next step"></select>
+          <select id="model-select" title="model used for the next step"></select>
         </label>
         <button id="btn-advanced" class="btn btn-ghost btn-sm" title="Per-role model overrides">⋯</button>
         <button id="btn-resume" class="btn btn-ghost btn-sm" hidden>Resume</button>
@@ -73,7 +73,7 @@
         <ul>
           <li><b>Control flow is deterministic</b> — the model only writes content, never decides what happens next.</li>
           <li><b>Resumable</b> — close the tab or restart the server; the interview continues where it stopped.</li>
-          <li><b>Local-first</b> — every call goes to LM Studio on your machine.</li>
+          <li><b>Local-first</b> — every call goes to a model server on your machine (LM Studio or Strata).</li>
         </ul>
         <p class="muted">Press <b>New interview</b> to start.</p>
       </div>
