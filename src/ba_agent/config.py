@@ -5,12 +5,51 @@ Precedence (lowest → highest): dataclass defaults → ``config.yaml`` → ``.e
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import os
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+log = logging.getLogger(__name__)
+
+
+def configure_logging(config: AppConfig | None = None, level: str = "INFO") -> None:
+    """Put the library loggers on one handler: console for a human watching, a file for post-mortems.
+
+    Nothing else in the project calls `basicConfig`, so without this every `log.warning` goes to
+    stderr with no timestamp and no trace afterwards — which is exactly what you need when a run
+    failed an hour ago and you are trying to work out why.
+    """
+    config = config or get_config()
+    root = logging.getLogger()
+    if getattr(root, "_ba_agent_configured", False):
+        return
+
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    log_file = config._abs(config.paths.logs_dir) / "ba_agent.log"
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=3)
+    except Exception:  # noqa: BLE001 - an unwritable log dir must not stop the run
+        file_handler = None
+    if file_handler is not None:
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+    root._ba_agent_configured = True  # type: ignore[attr-defined]
+
 
 # --------------------------------------------------------------------------- paths
 
@@ -49,9 +88,22 @@ class ServerConfig(BaseModel):
     port: int = 8765
     # Comma separated list, or ["*"]. The app is local-first; keep CORS tight by default.
     cors_origins: list[str] = Field(default_factory=lambda: ["http://127.0.0.1:8765", "http://localhost:8765"])
+    #: Optional bearer token. Empty (the default) means no auth — correct for a localhost-only tool.
+    #: Set it (or BA_AGENT_TOKEN) the moment the server is reachable from anything other than your own machine.
+    auth_token: str = ""
+
+    @field_validator("auth_token")
+    @classmethod
+    def _reject_weak_token(cls, value: str) -> str:
+        value = value.strip()
+        if value and len(value) < 16:
+            raise ValueError("server.auth_token must be at least 16 characters, or empty to disable auth")
+        return value
 
 
 class LMStudioConfig(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     base_url: str = "http://127.0.0.1:1234/v1"
     admin_url: str = "http://127.0.0.1:1234/api/v0"
     api_key: str = "lm-studio"
@@ -62,7 +114,18 @@ class LMStudioConfig(BaseModel):
     embedding_model: str | None = "text-embedding-nomic-embed-text-v1.5"
     # auto | json_schema | function_calling | prompt
     structured_output_method: str = "auto"
+    #: Explicit rung order for this profile, e.g. ["json_schema", "prompt"]. Empty = probe the model.
+    structured_output_rungs: list[str] = Field(default_factory=list)
     max_retries: int = 2
+    #: A batched tool call on a local Qwen gets truncated mid-payload, so the AutoGen reference
+    # implementation turns parallel tool calls off on both local lanes.
+    parallel_tool_calls: bool = False
+
+    @field_validator("structured_output_rungs")
+    @classmethod
+    def _normalise_rungs(cls, value: list[str]) -> list[str]:
+        allowed = {"json_schema", "function_calling", "prompt"}
+        return [rung.strip().lower() for rung in value if rung.strip().lower() in allowed]
 
     @field_validator("base_url", "admin_url")
     @classmethod
@@ -71,16 +134,32 @@ class LMStudioConfig(BaseModel):
 
 
 class StrataConfig(BaseModel):
-    base_url: str = "http://127.0.0.1:47831/v1"   # local Strata server (no key required)
-    api_key: str = "strata"                       # placeholder; never a real credential
-    request_timeout_s: float = 300.0
+    model_config = ConfigDict(validate_assignment=True)
+
+    base_url: str = "http://127.0.0.1:47831/v1"  # local Strata server (no key required)
+    api_key: str = "strata"  # placeholder; never a real credential
+    # Read timeout per chunk, not total wall time. Kept tight because a hung generation costs this
+    # whole value for every attempt the ladder makes.
+    request_timeout_s: float = 120.0
     connect_timeout_s: float = 10.0
     max_concurrency: int = 1
     default_model: str | None = "q2_0"
-    embedding_model: str | None = None            # no embeddings served -> BM25-only retrieval
+    embedding_model: str | None = None  # no embeddings served -> BM25-only retrieval
     # auto | json_schema | function_calling | prompt
     structured_output_method: str = "auto"
+    #: Explicit rung order for this profile, e.g. ["json_schema", "prompt"]. Empty = probe the model.
+    structured_output_rungs: list[str] = Field(default_factory=list)
     max_retries: int = 2
+    #: Local Qwen lanes spend most of the budget on reasoning before the first tool call; letting the
+    # backend batch tool calls in parallel truncates the payload mid-call and the tool never runs.
+    # The AutoGen reference implementation sets this to false for both local lanes.
+    parallel_tool_calls: bool = False
+
+    @field_validator("structured_output_rungs")
+    @classmethod
+    def _normalise_rungs(cls, value: list[str]) -> list[str]:
+        allowed = {"json_schema", "function_calling", "prompt"}
+        return [rung.strip().lower() for rung in value if rung.strip().lower() in allowed]
 
     @field_validator("base_url")
     @classmethod
@@ -111,6 +190,7 @@ def _default_roles() -> dict[str, RoleParams]:
         "critic": RoleParams(temperature=0.1),
         "diagrammer": RoleParams(temperature=0.3),
         "mermaid_reviewer": RoleParams(temperature=0.1),
+        "human": RoleParams(temperature=0.2),
     }
 
 
@@ -124,6 +204,12 @@ class InterviewConfig(BaseModel):
     max_summary_rejections: int = 2
     # Hard ceiling on interview questions so a run can never stall.
     max_total_questions: int = 40
+    # Transcript ingestion (Phase 3): how much of an uploaded transcript the engine will triage, and how
+    # much evidence a subject needs before the transcript counts as having answered it. Evidence is counted
+    # as (excerpt x distinct subject term) pairs, so a single rich chunk can cover a subject.
+    max_transcript_chunks: int = 24
+    transcript_chunk_chars: int = 1200
+    subject_coverage_threshold: int = 2
 
 
 class ReviewConfig(BaseModel):
@@ -139,12 +225,24 @@ class DiagramConfig(BaseModel):
     # produce an SVG for the deliverable bundle. OFF by default: it would send your specification to a
     # third party. Rendering failures never block the pipeline — the browser renders mermaid locally.
     validator_url: str | None = None
+    #: Render SVG/PNG for the PDF deliverable with the local mermaid-cli (`mmdc`) instead of a remote
+    #: endpoint. Requires Node + mermaid-cli on PATH; silently skipped when absent.
+    local_renderer: bool = True
+    render_timeout_seconds: float = 120.0
+    #: Also emit a raster PNG next to each SVG. Costs a second headless-browser render per diagram, so it
+    #: is off unless a stakeholder actually wants the bitmap.
+    emit_png: bool = False
 
 
 class KnowledgeConfig(BaseModel):
     docs_dir: str = "data"
-    chunk_size: int = 900
-    chunk_overlap: int = 140
+    #: A chunk_size of 0 (or a negative one) makes the packer append empty blocks forever, so the bounds
+    #: are enforced here rather than relying on the UI's BOUNDS table — config.yaml and env are also input.
+    chunk_size: int = Field(default=900, ge=100, le=8000)
+    chunk_overlap: int = Field(default=140, ge=0, le=2000)
+    #: Chunk on markdown headings (langchain-text-splitters). Falls back to paragraph packing if the
+    #: optional dependency is missing.
+    heading_aware: bool = True
     top_k: int = 6
     min_score: float = 0.05
     embed_batch_size: int = 16
@@ -159,8 +257,10 @@ class PathsConfig(BaseModel):
 
 class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
-    # Which backend the agents talk to: lmstudio | strata
-    provider: str = "lmstudio"
+    # Which backend the agents talk to: lmstudio | strata.
+    # Strata is the shipped default because it is the lane the AutoGen version runs on (q2_0 on the 5090),
+    # so an out-of-the-box run here exercises the same model as the reference implementation.
+    provider: str = "strata"
     lmstudio: LMStudioConfig = Field(default_factory=LMStudioConfig)
     strata: StrataConfig = Field(default_factory=StrataConfig)
     roles: dict[str, RoleParams] = Field(default_factory=_default_roles)
@@ -176,7 +276,7 @@ class AppConfig(BaseModel):
     @field_validator("provider")
     @classmethod
     def _known_provider(cls, v: str) -> str:
-        v = (v or "lmstudio").strip().lower()
+        v = (v or "strata").strip().lower()
         if v not in ("lmstudio", "strata"):
             raise ValueError(f"provider must be 'lmstudio' or 'strata', got {v!r}")
         return v
@@ -211,14 +311,19 @@ class AppConfig(BaseModel):
         return d
 
     def ensure_dirs(self) -> None:
-        for value in (self.paths.state_dir, self.paths.outputs_dir, self.paths.logs_dir,
-                      self.knowledge.docs_dir, "uploads"):
+        for value in (
+            self.paths.state_dir,
+            self.paths.outputs_dir,
+            self.paths.logs_dir,
+            self.knowledge.docs_dir,
+            "uploads",
+        ):
             self._abs(value).mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------------------------------- loading
 
-_ENV_MAP = {
+_ENV_MAP: dict[str, tuple[str | None, str, Callable[[str], Any]]] = {
     "BA_HOST": ("server", "host", str),
     "BA_PORT": ("server", "port", int),
     "BA_CORS_ORIGINS": ("server", "cors_origins", lambda v: [x.strip() for x in v.split(",") if x.strip()]),
@@ -228,16 +333,27 @@ _ENV_MAP = {
     "BA_MODEL": ("lmstudio", "default_model", str),
     "BA_EMBEDDING_MODEL": ("lmstudio", "embedding_model", str),
     "BA_STRUCTURED_METHOD": ("lmstudio", "structured_output_method", str),
+    "BA_STRUCTURED_RUNGS": (
+        "lmstudio",
+        "structured_output_rungs",
+        lambda value: [rung.strip() for rung in value.split(",") if rung.strip()],
+    ),
     "BA_MAX_CONCURRENCY": ("lmstudio", "max_concurrency", int),
     "BA_REQUEST_TIMEOUT_S": ("lmstudio", "request_timeout_s", float),
     "BA_PROVIDER": (None, "provider", str),
     "STRATA_BASE_URL": ("strata", "base_url", str),
     "STRATA_MODEL": ("strata", "default_model", str),
+    "STRATA_STRUCTURED_RUNGS": (
+        "strata",
+        "structured_output_rungs",
+        lambda value: [rung.strip() for rung in value.split(",") if rung.strip()],
+    ),
     "BA_MAX_QUESTIONS_PER_SUBJECT": ("interview", "max_questions_per_subject", int),
     "BA_MAX_GAP_ROUNDS": ("interview", "max_gap_rounds", int),
     "BA_MAX_SUMMARY_REJECTIONS": ("interview", "max_summary_rejections", int),
     "BA_MAX_REVIEW_ROUNDS": ("review", "max_review_rounds", int),
     "BA_KROKI_URL": ("diagram", "validator_url", str),
+    "BA_AGENT_TOKEN": ("server", "auth_token", str),
 }
 
 
@@ -277,7 +393,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             continue
         try:
             cast_value = caster(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            # A typo in an environment variable silently falling back to config.yaml is the hardest
+            # kind of misconfiguration to spot, so name the key that was ignored.
+            log.warning(
+                "ignoring %s=%r for %s.%s: %s",
+                env_key,
+                value,
+                section or "config",
+                field_name,
+                exc,
+            )
             continue
         section_obj = cfg if section is None else getattr(cfg, section)
         setattr(section_obj, field_name, cast_value)

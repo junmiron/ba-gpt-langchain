@@ -14,8 +14,10 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from typing import Any, Iterable, Sequence, Type, TypeVar
+from collections.abc import Iterable, Sequence
+from typing import Any, TypeVar
 
 import httpx
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -46,6 +48,11 @@ class ModelInfo(_PBaseModel):
     @property
     def is_chat(self) -> bool:
         return self.type in ("llm", "vlm") or self.type == "unknown"
+
+    #: True when the catalogue actually told us what the model can do. Providers with an admin API
+    #: (LM Studio) report capabilities; plain OpenAI-compatible servers do not, so an empty list means
+    #: "unknown", not "cannot".
+    capabilities_known: bool = False
 
     @property
     def supports_tools(self) -> bool:
@@ -105,8 +112,9 @@ def _chunk_delta(chunk: Any) -> tuple[str, str]:
     return text or "", reasoning or ""
 
 
-def build_messages(system_prompt: str | None, user_prompt: str | None,
-                   extra: Sequence[BaseMessage] | None = None) -> list[BaseMessage]:
+def build_messages(
+    system_prompt: str | None, user_prompt: str | None, extra: Sequence[BaseMessage] | None = None
+) -> list[BaseMessage]:
     messages: list[BaseMessage] = []
     if system_prompt:
         messages.append(SystemMessage(content=system_prompt))
@@ -127,36 +135,72 @@ It must validate against this JSON Schema:
 
 # --------------------------------------------------------------------------- gateway
 
+
 #: Shown verbatim in the UI when nothing can be called — it has to say what to do about it.
 def no_model_message(provider: str) -> str:
     if provider == "strata":
-        return ("No Strata model reachable. Start the Strata server (q2_0 on the 5090) and press Resume.")
+        return "No Strata model reachable. Start the Strata server (q2_0 on the 5090) and press Resume."
     return (
         "No LM Studio chat model available. Start LM Studio and load a chat model (or pick one in the model "
         "dropdown), then press Resume."
     )
 
 
-NO_MODEL_MESSAGE = no_model_message("lmstudio")
+NO_MODEL_MESSAGE = no_model_message("lmstudio")  # kept for callers that predate provider profiles
+
+
+log = logging.getLogger(__name__)
 
 
 class ModelGateway:
     def __init__(self, config: AppConfig | None = None) -> None:
         self.config = config or get_config()
-        lm = self.config.active_profile
-        self._http_timeout = httpx.Timeout(lm.request_timeout_s, connect=lm.connect_timeout_s)
+        self._cache: dict[tuple, ChatOpenAI] = {}
+        self._tool_probe: dict[str, bool] = {}
+        self.rebind()
+
+    def rebind(self) -> None:
+        """Re-derive the client wiring from the *current* active profile.
+
+        The profile is read here rather than snapshotted at construction so a provider switch
+        (UI dropdown, `--provider`, `BA_PROVIDER`) takes effect without restarting the server:
+        otherwise the cached ChatOpenAI clients keep pointing at the backend the gateway was
+        built for.
+        """
+        profile = self.config.active_profile
+        self._http_timeout = httpx.Timeout(profile.request_timeout_s, connect=profile.connect_timeout_s)
         self._client_kwargs: dict[str, Any] = {
-            "api_key": lm.api_key,
-            "base_url": lm.base_url,
+            "api_key": profile.api_key,
+            "base_url": profile.base_url,
             "timeout": self._http_timeout,
             "max_retries": 0,
+            # Sent as a request-body parameter: local Qwen lanes truncate a batched tool call mid-payload,
+            # so both reference implementations ask the backend for one tool call at a time.
+            "model_kwargs": {"parallel_tool_calls": profile.parallel_tool_calls},
         }
-        self._cache: dict[tuple, ChatOpenAI] = {}
-        self._semaphore = asyncio.Semaphore(max(1, lm.max_concurrency))
+        self._cache.clear()
+        self._tool_probe.clear()
         self._catalog: list[ModelInfo] = []
         self._catalog_ts: float = 0.0
-        self.usage: dict[str, Any] = {"calls": 0, "failures": 0, "prompt_chars": 0,
-                                      "completion_chars": 0, "tokens_in": 0, "tokens_out": 0}
+        self._semaphore = asyncio.Semaphore(max(1, profile.max_concurrency))
+        #: Structured-output rung that last worked for each model. A quantised local model fails
+        #: ``json_schema`` the same way on every call, so re-probing it burns a full request timeout
+        #: on each of the ~29 steps in a run.
+        self._learned_rung: dict[str, str] = {}
+        #: Why the last embedding attempt failed, if it did. Surfaced in the knowledge status so
+        #: "vector search off" is explainable rather than a silent degradation to BM25.
+        self.embed_error: str | None = None
+        self.usage: dict[str, Any] = {
+            "calls": 0,
+            "failures": 0,
+            "prompt_chars": 0,
+            "completion_chars": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+        }
+        #: How many structured calls each rung actually satisfied, so a run that silently fell back to
+        #: prompt-mode JSON for every step is visible in metadata rather than hidden inside the ladder.
+        self.rung_counts: dict[str, int] = {}
         #: Cumulative time actually spent inside model calls (used for per-step metrics in the UI).
         self.total_model_ms: int = 0
 
@@ -177,17 +221,20 @@ class ModelGateway:
                     resp.raise_for_status()
                     payload = resp.json()
                 for item in payload.get("data", []):
-                    models.append(ModelInfo(
-                        id=item.get("id", ""),
-                        type=item.get("type") or "llm",
-                        state=item.get("state") or "unknown",
-                        capabilities=item.get("capabilities") or [],
-                        max_context_length=item.get("max_context_length"),
-                        loaded_context_length=item.get("loaded_context_length"),
-                        quantization=item.get("quantization"),
-                        publisher=item.get("publisher"),
-                    ))
-            except Exception:
+                    models.append(
+                        ModelInfo(
+                            id=item.get("id", ""),
+                            type=item.get("type") or "llm",
+                            state=item.get("state") or "unknown",
+                            capabilities=item.get("capabilities") or [],
+                            capabilities_known=True,
+                            max_context_length=item.get("max_context_length"),
+                            loaded_context_length=item.get("loaded_context_length"),
+                            quantization=item.get("quantization"),
+                            publisher=item.get("publisher"),
+                        )
+                    )
+            except Exception:  # noqa: BLE001 - admin API failed, retry with the OpenAI-compatible endpoint
                 models = await self._list_models_openai_compat()
         else:
             models = await self._list_models_openai_compat()
@@ -199,11 +246,13 @@ class ModelGateway:
     async def _list_models_openai_compat(self) -> list[ModelInfo]:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
-                resp = await client.get(f"{self.config.active_profile.base_url}/models",
-                                        headers={"Authorization": f"Bearer {self.config.active_profile.api_key}"})
+                resp = await client.get(
+                    f"{self.config.active_profile.base_url}/models",
+                    headers={"Authorization": f"Bearer {self.config.active_profile.api_key}"},
+                )
                 resp.raise_for_status()
                 data = resp.json().get("data", [])
-        except Exception:
+        except Exception:  # noqa: BLE001 - catalogue unavailable: return an empty list, not a crash
             return []
         out = []
         for item in data:
@@ -254,8 +303,14 @@ class ModelGateway:
         overrides = overrides or {}
         return overrides.get(role) or self.config.role(role).model or self.config.active_profile.default_model
 
-    def chat(self, model: str | None, *, temperature: float | None = None,
-             max_output_tokens: int | None = None, streaming: bool = False) -> ChatOpenAI:
+    def chat(
+        self,
+        model: str | None,
+        *,
+        temperature: float | None = None,
+        max_output_tokens: int | None = None,
+        streaming: bool = False,
+    ) -> ChatOpenAI:
         if not model:
             raise RuntimeError(
                 f"No chat model available for provider '{self.config.provider}'. Load a model in the "
@@ -274,22 +329,89 @@ class ModelGateway:
         self._cache[key] = client
         return client
 
+    async def probe_tools(self, model_id: str | None) -> bool:
+        """Ask the model to call a trivial tool and see whether it actually does.
+
+        Providers without an admin API (Strata) never tell us what a model supports, so the only honest
+        answer comes from trying. One tiny request, cached per model.
+        """
+        resolved = await self.resolve_model(model_id)
+        if not resolved:
+            return False
+        if resolved in self._tool_probe:
+            return self._tool_probe[resolved]
+        from langchain_core.tools import Tool
+
+        noop = Tool(
+            name="ping",
+            description="Return 'pong'. Call this tool to confirm you can call tools.",
+            func=lambda: "pong",
+        )
+        try:
+            async with self._semaphore:
+                runnable = self.chat(resolved).bind_tools([noop])
+                message = await runnable.ainvoke(
+                    [HumanMessage("Call the ping tool exactly once. Do not answer in prose.")]
+                )
+            called = bool(getattr(message, "tool_calls", None))
+        except Exception:  # noqa: BLE001 - a failed probe just means "not proven"
+            called = False
+        self._tool_probe[resolved] = called
+        return called
+
     # -- structured calls ---------------------------------------------------
 
     def _ladder(self, model_id: str | None) -> list[str]:
-        configured = (self.config.active_profile.structured_output_method or "auto").lower()
+        """Rung order for structured calls: the profile's declared order wins, then a single forced
+        method, then a capability probe of the model catalogue."""
+        profile = self.config.active_profile
+        declared = list(profile.structured_output_rungs or [])
+        if declared:
+            return declared
+        configured = (profile.structured_output_method or "auto").lower()
         if configured in ("json_schema", "function_calling", "prompt"):
             return [configured]
         ladder = ["json_schema"]
         info = next((m for m in self._catalog if m.id == model_id), None)
-        if info is None or info.supports_tools:
+        # Unknown capability means unknown capability, not a denial: a server that lists no
+        # capabilities (Strata) still handles function calling fine. The ladder self-corrects via
+        # `_learned_rung` if the rung turns out to fail.
+        if info is None or info.supports_tools or not info.capabilities_known:
             ladder.append("function_calling")
         ladder.append("prompt")
+
+        #: Start where this model last succeeded, keeping the rest of the ladder as fallback. A rung
+        #: that is not in the ladder (capability changed after a reload) is ignored.
+        learned = self._learned_rung.get(model_id or "")
+        if learned and learned in ladder:
+            return [learned] + [rung for rung in ladder if rung != learned]
         return ladder
+
+    @staticmethod
+    def _is_transport_error(exc: BaseException) -> bool:
+        """True when the call never reached the model, as opposed to the model answering badly.
+
+        A refused connection is not a JSON problem. Treating it as one wastes the whole ladder and
+        then reports "ladder exhausted" for a backend that is merely down.
+        """
+        if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+            return True
+        name = type(exc).__name__
+        return any(token in name for token in ("Connection", "Timeout", "Connect", "Unreachable", "APIConnection"))
+
+    @staticmethod
+    def _is_timeout_error(exc: BaseException) -> bool:
+        """True when the connection held but the model produced nothing in time.
+
+        Worth separating from the other transport errors: a refused connection is cheap to retry and
+        usually clears, while a hung generation costs ``request_timeout_s`` on every retry. Three
+        retries at 300 s is fifteen minutes burned on one role.
+        """
+        return isinstance(exc, TimeoutError) or "Timeout" in type(exc).__name__
 
     async def structured(
         self,
-        schema: Type[T],
+        schema: type[T],
         *,
         system_prompt: str,
         user_prompt: str,
@@ -304,29 +426,35 @@ class ModelGateway:
         params = self.config.role(role) if role else None
         model_id = await self.resolve_model(model_override or (params.model if params else None))
         temperature = params.temperature if (temperature is None and params) else temperature
-        max_output_tokens = (params.max_output_tokens if max_output_tokens is None and params else max_output_tokens)
+        max_output_tokens = params.max_output_tokens if max_output_tokens is None and params else max_output_tokens
 
         # Nothing to call: fail once, loudly, instead of failing the whole ladder with retries and burying the
         # real reason ("LM Studio has no chat model") under nine identical warnings.
         if not model_id:
             self.usage["failures"] += 1
             msg = no_model_message(self.config.provider)
-            await emit(EventType.WARNING, {"step": step, "role": role,
-                                           "message": msg})
-            return StructuredResult(parsed=None, raw_text="", method="no_model", attempts=0, degraded=True,
-                                    error=msg)
+            await emit(EventType.WARNING, {"step": step, "role": role, "message": msg})
+            return StructuredResult(parsed=None, raw_text="", method="no_model", attempts=0, degraded=True, error=msg)
 
         started = time.perf_counter()
         attempts = 0
         errors: list[str] = []
         raw_text = ""
+        #: Consecutive transport failures. Once the backend is demonstrably unreachable there is
+        # no point walking json_schema -> function_calling -> prompt: every rung fails for the same reason.
+        transport_failures = 0
+        transport_budget = self.config.active_profile.max_retries + 1
+        #: Rungs that hung rather than refused. Each gets exactly one attempt: retrying a hung
+        # request costs request_timeout_s again, and the ladder has other rungs worth trying.
+        rungs = self._ladder(model_id)
+        timed_out_rungs = 0
 
-        for method in self._ladder(model_id):
+        for method in rungs:
             messages = build_messages(system_prompt, user_prompt)
             if method == "prompt":
-                messages[0].content = (
-                    f"{system_prompt}\n\n{_SCHEMA_INSTRUCTION.format(schema=dumps(schema.model_json_schema()))}"
-                )
+                messages[
+                    0
+                ].content = f"{system_prompt}\n\n{_SCHEMA_INSTRUCTION.format(schema=dumps(schema.model_json_schema()))}"
             for attempt in range(1, self.config.active_profile.max_retries + 2):
                 attempts += 1
                 try:
@@ -338,51 +466,179 @@ class ModelGateway:
                                 raise ValueError("no JSON object found in the model reply")
                             parsed = schema.model_validate(data)
                         else:
-                            runnable = self.chat(model_id, temperature=temperature,
-                                                 max_output_tokens=max_output_tokens).with_structured_output(
-                                schema, method=method, include_raw=True)
+                            runnable = self.chat(
+                                model_id, temperature=temperature, max_output_tokens=max_output_tokens
+                            ).with_structured_output(schema, method=method, include_raw=True)  # type: ignore[arg-type]
                             result = await runnable.ainvoke(messages)
                             raw_message = result.get("raw") if isinstance(result, dict) else None
                             raw_text = _message_text(getattr(raw_message, "content", ""))
-                            parsed = result.get("parsed") if isinstance(result, dict) else result
+                            parsed_value: Any = result.get("parsed") if isinstance(result, dict) else result
+                            parsed = parsed_value
                             if parsed is None:
-                                raise ValueError(str((result or {}).get("parsing_error") or "model returned no valid payload"))
+                                raise ValueError(
+                                    str((result or {}).get("parsing_error") or "model returned no valid payload")
+                                )
 
                     latency_ms = int((time.perf_counter() - started) * 1000)
+                    prompt_chars = sum(len(m.content) for m in messages if isinstance(m.content, str))
                     self.usage["calls"] += 1
                     self.total_model_ms += latency_ms
-                    self.usage["prompt_chars"] += sum(len(m.content) for m in messages if isinstance(m.content, str))
+                    self._learned_rung[model_id or ""] = method
+                    self.rung_counts[method] = self.rung_counts.get(method, 0) + 1
+                    self.usage["prompt_chars"] += prompt_chars
                     self.usage["completion_chars"] += len(raw_text)
+                    try:
+                        await emit(
+                            EventType.LOG,
+                            {
+                                "category": "model_call",
+                                "role": role,
+                                "step": step,
+                                "model": model_id or "",
+                                "method": method,
+                                "attempts": attempts,
+                                "latency_ms": latency_ms,
+                                "prompt_chars": prompt_chars,
+                                "completion_chars": len(raw_text),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 - telemetry must not turn a good reply into a retry
+                        log.debug("could not emit model-call timing for %s/%s: %s", role, step, exc)
                     return StructuredResult(
-                        parsed=parsed, raw_text=raw_text, method=method, attempts=attempts,
-                        latency_ms=int((time.perf_counter() - started) * 1000), model=model_id or "",
+                        parsed=parsed,
+                        raw_text=raw_text,
+                        method=method,
+                        attempts=attempts,
+                        latency_ms=latency_ms,
+                        model=model_id or "",
                     )
                 except Exception as exc:  # noqa: BLE001 — every failure is recoverable via the ladder
                     errors.append(f"{method}#{attempt}: {type(exc).__name__}: {exc}")
                     self.usage["failures"] += 1
-                    await emit(EventType.WARNING, {
-                        "step": step, "role": role, "model": model_id,
-                        "message": f"structured output failed ({method}, attempt {attempt}) — retrying",
-                        "detail": str(exc)[:400],
-                    })
-                    messages = messages + [AIMessage(content=raw_text or ""), HumanMessage(
-                        content="Your previous reply was not valid for the required JSON schema.\n"
-                                f"Validation problem: {str(exc)[:500]}\n"
-                                "Return ONLY the corrected JSON object, nothing else."
-                    )]
+
+                    if self._is_transport_error(exc):
+                        if self._is_timeout_error(exc):
+                            timed_out_rungs += 1
+                            if timed_out_rungs >= len(rungs):
+                                errors.append(f"backend unresponsive: {type(exc).__name__}: {exc}")
+                                await emit(
+                                    EventType.WARNING,
+                                    {
+                                        "step": step,
+                                        "role": role,
+                                        "model": model_id,
+                                        "message": (
+                                            f"every rung timed out ({timed_out_rungs} attempt(s)) — the backend is "
+                                            "unresponsive, not picky about the output method"
+                                        ),
+                                        "detail": str(exc)[:400],
+                                    },
+                                )
+                                return StructuredResult(
+                                    parsed=None,
+                                    raw_text="",
+                                    method="unreachable",
+                                    attempts=attempts,
+                                    latency_ms=int((time.perf_counter() - started) * 1000),
+                                    model=model_id or "",
+                                    degraded=True,
+                                    error=f"backend unresponsive: {type(exc).__name__}: {exc}",
+                                )
+                            await emit(
+                                EventType.WARNING,
+                                {
+                                    "step": step,
+                                    "role": role,
+                                    "model": model_id,
+                                    "message": (
+                                        f"{method} rung timed out after "
+                                        f"{self.config.active_profile.request_timeout_s} s — moving to the next rung "
+                                        "instead of retrying a hung request"
+                                    ),
+                                    "detail": str(exc)[:400],
+                                },
+                            )
+                            break
+
+                        # The model never answered, so there is nothing to correct. A refused
+                        # connection is cheap to retry and usually clears, so backing off and retrying
+                        # the same rung is the right move; walking the ladder would produce identical
+                        # failures for a backend that is simply down.
+                        transport_failures += 1
+                        if transport_failures >= transport_budget:
+                            errors.append(f"backend unreachable: {type(exc).__name__}: {exc}")
+                            await emit(
+                                EventType.WARNING,
+                                {
+                                    "step": step,
+                                    "role": role,
+                                    "model": model_id,
+                                    "message": f"backend unreachable after {transport_failures} attempt(s) — giving up",
+                                    "detail": str(exc)[:400],
+                                },
+                            )
+                            return StructuredResult(
+                                parsed=None,
+                                raw_text="",
+                                method="unreachable",
+                                attempts=attempts,
+                                latency_ms=int((time.perf_counter() - started) * 1000),
+                                model=model_id or "",
+                                degraded=True,
+                                error=f"backend unreachable: {type(exc).__name__}: {exc}",
+                            )
+                        await emit(
+                            EventType.WARNING,
+                            {
+                                "step": step,
+                                "role": role,
+                                "model": model_id,
+                                "message": f"backend unreachable ({type(exc).__name__}) — backing off and retrying",
+                                "detail": str(exc)[:400],
+                            },
+                        )
+                        await asyncio.sleep(min(4.0, 0.5 * 2 ** (transport_failures - 1)))
+                        continue
+
+                    await emit(
+                        EventType.WARNING,
+                        {
+                            "step": step,
+                            "role": role,
+                            "model": model_id,
+                            "message": f"structured output failed ({method}, attempt {attempt}) — retrying",
+                            "detail": str(exc)[:400],
+                        },
+                    )
+                    messages = [
+                        *messages,
+                        AIMessage(content=raw_text or ""),
+                        HumanMessage(
+                            content="Your previous reply was not valid for the required JSON schema.\n"
+                            f"Validation problem: {str(exc)[:500]}\n"
+                            "Return ONLY the corrected JSON object, nothing else."
+                        ),
+                    ]
                     raw_text = ""
 
         # Thinking models can exhaust a token budget on internal reasoning and fail every rung of the ladder
         # without producing parseable output. One final uncapped prompt attempt recovers what the cap starved.
         if max_output_tokens is not None:
-            await emit(EventType.WARNING, {
-                "step": step, "role": role, "model": model_id,
-                "message": (f"ladder exhausted under a {max_output_tokens}-token cap — trying once more without a cap"),
-            })
-            messages = build_messages(system_prompt, user_prompt)
-            messages[0].content = (
-                f"{system_prompt}\n\n{_SCHEMA_INSTRUCTION.format(schema=dumps(schema.model_json_schema()))}"
+            await emit(
+                EventType.WARNING,
+                {
+                    "step": step,
+                    "role": role,
+                    "model": model_id,
+                    "message": (
+                        f"ladder exhausted under a {max_output_tokens}-token cap — trying once more without a cap"
+                    ),
+                },
             )
+            messages = build_messages(system_prompt, user_prompt)
+            messages[
+                0
+            ].content = f"{system_prompt}\n\n{_SCHEMA_INSTRUCTION.format(schema=dumps(schema.model_json_schema()))}"
             try:
                 async with self._semaphore:
                     raw_text = await self._complete(model_id, messages, temperature, None)
@@ -390,22 +646,52 @@ class ModelGateway:
                 if data is not None:
                     parsed = schema.model_validate(data)
                     attempts += 1
+                    latency_ms = int((time.perf_counter() - started) * 1000)
+                    prompt_chars = sum(len(m.content) for m in messages if isinstance(m.content, str))
                     self.usage["calls"] += 1
-                    self.total_model_ms += int((time.perf_counter() - started) * 1000)
+                    self.usage["prompt_chars"] += prompt_chars
+                    self.usage["completion_chars"] += len(raw_text)
+                    self.total_model_ms += latency_ms
+                    try:
+                        await emit(
+                            EventType.LOG,
+                            {
+                                "category": "model_call",
+                                "role": role,
+                                "step": step,
+                                "model": model_id or "",
+                                "method": "prompt_uncapped",
+                                "attempts": attempts,
+                                "latency_ms": latency_ms,
+                                "prompt_chars": prompt_chars,
+                                "completion_chars": len(raw_text),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 - telemetry must not turn a good reply into a retry
+                        log.debug("could not emit model-call timing for %s/%s: %s", role, step, exc)
                     return StructuredResult(
-                        parsed=parsed, raw_text=raw_text, method="prompt_uncapped", attempts=attempts,
-                        latency_ms=int((time.perf_counter() - started) * 1000), model=model_id or "",
+                        parsed=parsed,
+                        raw_text=raw_text,
+                        method="prompt_uncapped",
+                        attempts=attempts,
+                        latency_ms=latency_ms,
+                        model=model_id or "",
                     )
-                errors.append(f"prompt_uncapped: no JSON object found in the model reply")
+                errors.append("prompt_uncapped: no JSON object found in the model reply")
             except Exception as exc:  # noqa: BLE001
                 self.usage["failures"] += 1
                 attempts += 1
                 errors.append(f"prompt_uncapped: {type(exc).__name__}: {exc}")
 
         return StructuredResult(
-            parsed=None, raw_text="", method="failed", attempts=attempts,
-            latency_ms=int((time.perf_counter() - started) * 1000), model=model_id or "",
-            degraded=True, error=" | ".join(errors[-3:]),
+            parsed=None,
+            raw_text="",
+            method="failed",
+            attempts=attempts,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            model=model_id or "",
+            degraded=True,
+            error=" | ".join(errors[-3:]),
         )
 
     # -- text calls ---------------------------------------------------------
@@ -425,7 +711,7 @@ class ModelGateway:
         params = self.config.role(role) if role else None
         model_id = await self.resolve_model(model_override or (params.model if params else None))
         temperature = params.temperature if (temperature is None and params) else temperature
-        max_output_tokens = (params.max_output_tokens if max_output_tokens is None and params else max_output_tokens)
+        max_output_tokens = params.max_output_tokens if max_output_tokens is None and params else max_output_tokens
 
         if not model_id:
             self.usage["failures"] += 1
@@ -457,7 +743,9 @@ class ModelGateway:
                         delta, think = _chunk_delta(chunk)
                         if think:
                             reasoning.append(think)
-                            await emit(EventType.REASONING, {"step": step, "role": role, "model": model_id, "text": think})
+                            await emit(
+                                EventType.REASONING, {"step": step, "role": role, "model": model_id, "text": think}
+                            )
                         if delta:
                             chunks.append(delta)
                             pending.append(delta)
@@ -479,11 +767,18 @@ class ModelGateway:
         # reasoning and emit zero visible content — the stream ends cleanly with finish_reason=length and an
         # empty completion. One uncapped retry recovers the output; request_timeout_s still bounds it.
         if not text.strip() and error is None and max_output_tokens is not None:
-            await emit(EventType.WARNING, {
-                "step": step, "role": role, "model": model_id,
-                "message": (f"no visible output within {max_output_tokens} tokens — the model likely spent its "
-                            f"budget on internal reasoning; retrying without a token cap"),
-            })
+            await emit(
+                EventType.WARNING,
+                {
+                    "step": step,
+                    "role": role,
+                    "model": model_id,
+                    "message": (
+                        f"no visible output within {max_output_tokens} tokens — the model likely spent its "
+                        f"budget on internal reasoning; retrying without a token cap"
+                    ),
+                },
+            )
             text2, reasoning_text2, error2 = await _stream_once(None)
             if text2.strip() or error2 is not None:
                 text, reasoning_text, error = text2, reasoning_text2, error2
@@ -491,11 +786,15 @@ class ModelGateway:
         latency_ms = int((time.perf_counter() - started) * 1000)
         self.total_model_ms += model_ms
         self.usage["completion_chars"] += len(text)
-        return TextResult(text=text, reasoning=reasoning_text, model=model_id or "", latency_ms=latency_ms,
-                          error=error)
+        return TextResult(text=text, reasoning=reasoning_text, model=model_id or "", latency_ms=latency_ms, error=error)
 
-    async def _complete(self, model_id: str | None, messages: list[BaseMessage],
-                        temperature: float | None, max_output_tokens: int | None) -> str:
+    async def _complete(
+        self,
+        model_id: str | None,
+        messages: list[BaseMessage],
+        temperature: float | None,
+        max_output_tokens: int | None,
+    ) -> str:
         client = self.chat(model_id, temperature=temperature, max_output_tokens=max_output_tokens)
         message = await client.ainvoke(messages)
         return _message_text(message.content)
@@ -515,8 +814,11 @@ class ModelGateway:
         vectors: list[list[float]] = []
         batch = max(1, self.config.knowledge.embed_batch_size)
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.config.active_profile.request_timeout_s,
-                                                              connect=self.config.active_profile.connect_timeout_s)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self.config.active_profile.request_timeout_s, connect=self.config.active_profile.connect_timeout_s
+                )
+            ) as client:
                 for start in range(0, len(texts), batch):
                     slice_ = list(texts[start : start + batch])
                     resp = await client.post(
@@ -529,8 +831,11 @@ class ModelGateway:
                     if len(data) != len(slice_):
                         raise RuntimeError("embedding response size mismatch")
                     vectors.extend([item["embedding"] for item in sorted(data, key=lambda d: d.get("index", 0))])
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - embeddings are optional; retrieval degrades to BM25
+            self.embed_error = f"{model}: {exc}"
+            log.warning("embedding failed, falling back to BM25: %s", self.embed_error)
             return None
+        self.embed_error = None
         return vectors
 
     async def aclose(self) -> None:

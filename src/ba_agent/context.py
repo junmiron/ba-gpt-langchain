@@ -8,9 +8,9 @@ makes each step reproducible.
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from collections.abc import Iterable
 
-from .schemas import LedgerItem, SessionState, SummaryDoc
+from .schemas import SessionState, SummaryDoc
 
 
 def coverage_table(state: SessionState) -> str:

@@ -22,7 +22,10 @@ class Sandbox:
         # Order is preserved (not sorted): a relative path resolves against the first matching root, and callers
         # pass their primary directory first on purpose.
         combined: list[Path] = []
-        for root in [*self.writable_roots, *[(r.resolve() if hasattr(r, "resolve") else r) for r in (readable_roots or [])]]:
+        for root in [
+            *self.writable_roots,
+            *[(r.resolve() if hasattr(r, "resolve") else r) for r in (readable_roots or [])],
+        ]:
             if root not in combined:
                 combined.append(root)
         self.readable_roots = combined
@@ -60,8 +63,7 @@ class Sandbox:
                 candidate = candidates[0] if candidates else candidate
         if not self._inside(candidate, roots):
             raise SandboxError(
-                f"Path '{path}' is outside the allowed directories "
-                f"({', '.join(str(r) for r in roots)})."
+                f"Path '{path}' is outside the allowed directories ({', '.join(str(r) for r in roots)})."
             )
         return candidate
 

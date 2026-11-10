@@ -12,6 +12,11 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from .config import get_config
+from .prompt_context import PROMPT_CONTRACTS
+
+
+class PromptContextError(ValueError):
+    """A prompt was rendered with a context that does not match its contract."""
 
 
 @lru_cache(maxsize=1)
@@ -40,10 +45,19 @@ def _prompts_dir() -> Path:
 def render(name: str, **context) -> tuple[str, str]:
     """Render ``<name>`` into ``(system_prompt, user_prompt)``.
 
+    The context is validated against the template's contract first (see :mod:`ba_agent.prompt_context`),
+    so a misspelled or missing variable fails fast and offline instead of mid-interview.
+
     Templates may be split with a literal line ``---USER---`` so both halves stay in one readable file.
     A template without the marker is entirely the system prompt and the user part is empty: callers such as
     the chat agent supply the user message themselves, and a generic fallback would discard the persona.
     """
+    contract = PROMPT_CONTRACTS.get(name)
+    if contract is not None:
+        try:
+            context = contract(**context).model_dump()
+        except Exception as exc:
+            raise PromptContextError(f"prompt '{name}' context is invalid: {exc}") from exc
     template = _env().get_template(f"{name}.md.j2")
     text = template.render(**context).strip()
     if "---USER---" in text:

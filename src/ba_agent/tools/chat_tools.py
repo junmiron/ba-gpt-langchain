@@ -6,12 +6,15 @@ per-session lock and cannot race with a workflow step that is running at the sam
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import tool
 
-from ..schemas import LedgerItem, SessionState
+from ..retriever import document_citation
+from ..schemas import LedgerItem, LedgerKind, SessionState
 from .sandbox import Sandbox
 
 
@@ -23,6 +26,8 @@ class ChatContext:
     mutate: Callable[[Callable[[SessionState], str]], Awaitable[str]]
     knowledge: Any
     sandbox: Sandbox
+    #: ``langchain-core`` Runnable over the same index (Phase 1.1); falls back to ``knowledge`` if unset.
+    retriever: Any = None
     store: Any = None
 
 
@@ -57,39 +62,63 @@ def build_chat_tools(ctx: ChatContext) -> list[Any]:
         lines = []
         for item in items:
             acceptance = f"; acceptance: {' | '.join(item.acceptance)}" if item.acceptance else "; acceptance: MISSING"
-            lines.append(f"- {item.id} [{item.category.value if item.category else 'n/a'}/{item.priority.value if item.priority else '-'}] "
-                         f"{item.title}: {item.body}{acceptance}")
+            lines.append(
+                f"- {item.id} [{item.category.value if item.category else 'n/a'}/{item.priority.value if item.priority else '-'}] "
+                f"{item.title}: {item.body}{acceptance}"
+            )
         return "\n".join(lines)
 
     @tool
     async def search_knowledge(query: str, max_results: int = 4) -> str:
         """Search the indexed knowledge base (uploaded documents and reference websites)."""
-        results = await ctx.knowledge.search(query, k=max(1, min(int(max_results or 4), 8)))
-        if not results:
+        limit = max(1, min(int(max_results or 4), 8))
+        retriever = ctx.retriever or ctx.knowledge
+        documents = await retriever.ainvoke(query)
+        documents = list(documents)[:limit]
+        if not documents:
             return "No relevant material in the knowledge base."
-        return "\n\n---\n\n".join(item.citation() for item in results)
+        return "\n\n---\n\n".join(document_citation(document) for document in documents)
 
     @tool
     async def read_artifact(name: str) -> str:
         """Read a generated artefact by file name, e.g. 'functional_specification.md' or 'process_diagram.mmd'."""
+        # `name` comes from a model, so it must be a bare file name. `Path(...).name` strips any directory
+        # component: without it, "../other_session/spec.md" resolves inside the allowed outputs root and
+        # leaks another session's artefacts — the sandbox only checks roots, not which session owns the file.
+        safe_name = Path(str(name or "")).name
+        if not safe_name or safe_name in {".", ".."}:
+            available = ", ".join(a["name"] for a in _artifacts(ctx)) or "none yet"
+            return f"Invalid artefact name '{name}'. Available artefacts: {available}"
         try:
-            return ctx.sandbox.read_text(f"{ctx.session_id}/{name}", max_chars=12_000)
+            return ctx.sandbox.read_text(f"{ctx.session_id}/{safe_name}", max_chars=12_000)
         except Exception as exc:  # noqa: BLE001 — report, don't crash the loop
             available = ", ".join(a["name"] for a in _artifacts(ctx)) or "none yet"
-            return f"Could not read '{name}' ({exc}). Available artefacts: {available}"
+            return f"Could not read '{safe_name}' ({exc}). Available artefacts: {available}"
 
     @tool
     async def add_ledger_note(kind: str, title: str, body: str) -> str:
         """Record something the stakeholder just decided. kind: fact | requirement | risk | assumption | decision."""
-        allowed = {"fact", "requirement", "risk", "assumption", "decision", "open_question"}
+        allowed: dict[str, LedgerKind] = {
+            "fact": "fact",
+            "requirement": "requirement",
+            "risk": "risk",
+            "assumption": "assumption",
+            "decision": "decision",
+            "open_question": "open_question",
+        }
         normalised = (kind or "fact").strip().lower()
         if normalised not in allowed:
             return f"Invalid kind '{kind}'. Use one of: {', '.join(sorted(allowed))}."
 
         def apply(state: SessionState) -> str:
-            item_id = state.new_requirement_id() if normalised == "requirement" else f"{normalised.upper()}-{len(state.ledger) + 1}"
-            state.ledger.append(LedgerItem(id=item_id, kind=normalised, title=title.strip(), body=body.strip(),
-                                           subject="chat"))
+            item_id = (
+                state.new_requirement_id()
+                if normalised == "requirement"
+                else f"{normalised.upper()}-{len(state.ledger) + 1}"
+            )
+            state.ledger.append(
+                LedgerItem(id=item_id, kind=allowed[normalised], title=title.strip(), body=body.strip(), subject="chat")
+            )
             return f"Recorded {item_id} ({normalised}): {title.strip() or body.strip()[:60]}"
 
         return await ctx.mutate(apply)
@@ -97,6 +126,7 @@ def build_chat_tools(ctx: ChatContext) -> list[Any]:
     @tool
     async def skip_subject(name: str) -> str:
         """Mark an interview subject as not applicable when the stakeholder says it does not apply to them."""
+
         def apply(state: SessionState) -> str:
             needle = (name or "").strip().lower()
             for subject in state.subjects:

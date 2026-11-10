@@ -6,16 +6,18 @@ import pytest
 
 from ba_agent.jsonx import extract_json
 from ba_agent.knowledge import KnowledgeService, chunk_text, extract_main_content
-from ba_agent.mermaid_utils import clean_mermaid, quote_risky_labels, validate_mermaid
+from ba_agent.mermaid_utils import clean_mermaid, close_open_blocks, quote_risky_labels, validate_mermaid
 from ba_agent.schemas import LedgerItem, RequirementCategory, SessionState
 from ba_agent.spec import assemble_spec, deterministic_gaps, lint_spec
 from ba_agent.tools.sandbox import Sandbox, SandboxError
 
-
 # --------------------------------------------------------------------------- chunking
 
+
 def test_chunk_text_respects_size_and_keeps_sentences_whole():
-    text = "\n\n".join([f"Paragraph {i}. " + ("Some reasonably long sentence about requirements. " * 6) for i in range(8)])
+    text = "\n\n".join(
+        [f"Paragraph {i}. " + ("Some reasonably long sentence about requirements. " * 6) for i in range(8)]
+    )
     chunks = chunk_text(text, chunk_size=400, overlap=80)
 
     assert len(chunks) > 1
@@ -38,14 +40,18 @@ def test_chunking_prefers_paragraph_boundaries():
 
 # --------------------------------------------------------------------------- JSON repair
 
-@pytest.mark.parametrize("raw", [
-    '{"a": 1}',
-    '```json\n{"a": 1}\n```',
-    'Sure! Here is the object:\n{"a": 1, "b": [1,2,],}',
-    "prefix noise {'a': true} suffix",
-    '{"a": True, "b": None}',
-    '{"text": "line one\nline two"}',
-])
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"a": 1}',
+        '```json\n{"a": 1}\n```',
+        'Sure! Here is the object:\n{"a": 1, "b": [1,2,],}',
+        "prefix noise {'a': true} suffix",
+        '{"a": True, "b": None}',
+        '{"text": "line one\nline two"}',
+    ],
+)
 def test_extract_json_handles_local_model_mess(raw):
     data = extract_json(raw)
     assert isinstance(data, dict)
@@ -66,8 +72,27 @@ def test_validate_accepts_clean_diagram():
 
 
 def test_validate_flags_unquoted_parentheses_and_missing_keyword():
-    bad = 'graph\n    A(Order accepted) --> B[Done]'
+    # `graph` with no direction, and a square label carrying unquoted parentheses — both are real
+    # mermaid-cli parse errors (verified against mmdc 12.2.0).
+    bad = "graph\n    A[Total (net)] --> B[Done]"
     report = validate_mermaid(bad)
+    assert not report.ok
+    assert any("unquoted label" in error for error in report.errors)
+
+
+def test_round_labels_with_spaces_are_not_false_positives():
+    """`A(Claim intake)` is valid mermaid. Flagging it used to force a needless repair round."""
+    report = validate_mermaid("graph TD\n    A(Claim intake) --> B(Review)")
+    assert report.ok, report.errors
+    assert (
+        quote_risky_labels("graph TD\n    A(Claim intake) --> B(Review)")
+        == "graph TD\n    A(Claim intake) --> B(Review)"
+    )
+
+
+def test_validate_flags_pipe_inside_a_node_label():
+    # A pipe inside an unquoted label is read as an edge-label separator and is a hard parse error.
+    report = validate_mermaid("graph TD\n    A[claim | intake] --> B[Done]")
     assert not report.ok
     assert any("unquoted label" in error for error in report.errors)
 
@@ -79,8 +104,41 @@ def test_validate_flags_reserved_node_id_and_unbalanced_brackets():
 
 
 def test_auto_fix_quotes_risky_labels():
-    fixed = quote_risky_labels('flowchart TD\n    A(Order accepted) --> B[Done]')
+    fixed = quote_risky_labels("flowchart TD\n    A[Total (net)] --> B[claim | intake]")
+    assert '"' in fixed
     assert validate_mermaid(fixed).ok, validate_mermaid(fixed).errors
+
+
+def test_validate_catches_unclosed_sequence_blocks():
+    # A real deliverable produced this: an `alt` whose `end` was dropped, which mermaid-cli rejects while
+    # the line-by-line bracket checker happily passed it.
+    diagram = (
+        "sequenceDiagram\n"
+        "    Broker->>Portal: Submit claim\n"
+        "    alt Valid claim\n"
+        "        Portal->>API: Validate\n"
+        "    else Invalid\n"
+        "        Portal->>Broker: Reject\n"
+    )
+    report = validate_mermaid(diagram)
+    assert not report.ok, "an unclosed alt block must be an error, not a warning"
+    assert any("no matching 'end'" in error for error in report.errors), report.errors
+
+
+def test_close_open_blocks_repairs_it_without_touching_balanced_diagrams():
+    balanced = "sequenceDiagram\n    A->>B: hi\n    alt yes\n        A->>B: ok\n    end\n"
+    assert close_open_blocks(balanced) == clean_mermaid(balanced)
+
+    broken = "sequenceDiagram\n    A->>B: hi\n    alt yes\n        A->>B: ok\n"
+    repaired = close_open_blocks(broken)
+    assert validate_mermaid(repaired).ok, validate_mermaid(repaired).errors
+    assert repaired.endswith("end")
+
+
+def test_close_open_blocks_leaves_stray_end_to_the_model():
+    # Appending more `end`s cannot fix an extra one; guessing here would make the diagram worse.
+    diagram = "sequenceDiagram\n    A->>B: hi\n    end\n"
+    assert close_open_blocks(diagram).count("end") == 1
 
 
 def test_clean_mermaid_strips_fences_and_comments():
@@ -89,6 +147,7 @@ def test_clean_mermaid_strips_fences_and_comments():
 
 
 # --------------------------------------------------------------------------- linter
+
 
 def _state_with_sections(**sections) -> SessionState:
     state = SessionState(session_id="s-1", brief="brief text here")
@@ -108,8 +167,14 @@ def test_lint_reports_missing_and_thin_sections():
 
 def test_lint_requires_traceability_and_acceptance_criteria():
     state = _state_with_sections()
-    item = LedgerItem(id="FR-001", kind="requirement", title="Submit claim", body="The system shall submit claims.",
-                      category=RequirementCategory.FUNCTIONAL, priority=None)
+    item = LedgerItem(
+        id="FR-001",
+        kind="requirement",
+        title="Submit claim",
+        body="The system shall submit claims.",
+        category=RequirementCategory.FUNCTIONAL,
+        priority=None,
+    )
     item.priority = None
     state.ledger.append(item)
     findings = lint_spec(state, min_functional_requirements=1)
@@ -123,12 +188,24 @@ def test_deterministic_gaps_detect_missing_structure():
     assert gaps, "an empty ledger must produce clarification questions"
 
     for index in range(6):
-        state.ledger.append(LedgerItem(id=f"FR-{index:03d}", kind="requirement", title=f"Cap {index}",
-                                       body="The system shall do something useful and measurable with acceptance.",
-                                       category=RequirementCategory.FUNCTIONAL))
-    state.ledger.append(LedgerItem(id="NFR-900", kind="requirement", title="Performance",
-                                   body="Response time under 2 seconds at peak load.",
-                                   category=RequirementCategory.NON_FUNCTIONAL))
+        state.ledger.append(
+            LedgerItem(
+                id=f"FR-{index:03d}",
+                kind="requirement",
+                title=f"Cap {index}",
+                body="The system shall do something useful and measurable with acceptance.",
+                category=RequirementCategory.FUNCTIONAL,
+            )
+        )
+    state.ledger.append(
+        LedgerItem(
+            id="NFR-900",
+            kind="requirement",
+            title="Performance",
+            body="Response time under 2 seconds at peak load.",
+            category=RequirementCategory.NON_FUNCTIONAL,
+        )
+    )
     state.ledger.append(LedgerItem(id="D-1", kind="decision", body="We will use the existing SSO."))
     state.summary = None
     assert isinstance(deterministic_gaps(state), list)
@@ -143,6 +220,7 @@ def test_assemble_spec_owns_heading_levels():
 
 
 # --------------------------------------------------------------------------- sandbox
+
 
 def test_sandbox_blocks_path_escape(tmp_path):
     writable = tmp_path / "outputs"
@@ -160,13 +238,16 @@ def test_sandbox_blocks_path_escape(tmp_path):
 
 # --------------------------------------------------------------------------- knowledge
 
+
 @pytest.mark.asyncio
 async def test_knowledge_search_finds_relevant_chunk_without_embeddings(services):
     service: KnowledgeService = services.knowledge
     (services.config.root / "data").mkdir(exist_ok=True)
     (services.config.root / "data" / "ba-guide.md").write_text(
         "# Interview guide\n\nAsk about non-functional requirements such as latency, availability and GDPR "
-        "compliance. Repeat for every stakeholder group.\n\n" + "Unrelated filler text. " * 40, encoding="utf-8")
+        "compliance. Repeat for every stakeholder group.\n\n" + "Unrelated filler text. " * 40,
+        encoding="utf-8",
+    )
 
     result = await service.index_directory()
     assert result["indexed"] == 1
@@ -202,6 +283,7 @@ def test_extract_main_content_prefers_article():
 
 # --------------------------------------------------------------------------- store
 
+
 def test_event_log_replay_is_ordered_and_cursorable(services):
     state = services.store.create_session(brief="cursor test")
     first = services.store.log_event(state.session_id, "step_start", {"phase": "intake"})
@@ -217,8 +299,9 @@ def test_event_log_replay_is_ordered_and_cursorable(services):
 
 def test_session_state_roundtrips_through_sqlite(services):
     state = services.store.create_session(brief="roundtrip")
-    state.ledger.append(LedgerItem(id="FR-001", kind="requirement", title="T", body="B",
-                                   category=RequirementCategory.FUNCTIONAL))
+    state.ledger.append(
+        LedgerItem(id="FR-001", kind="requirement", title="T", body="B", category=RequirementCategory.FUNCTIONAL)
+    )
     services.store.save_state(state)
 
     loaded = services.store.load_state(state.session_id)
@@ -226,6 +309,7 @@ def test_session_state_roundtrips_through_sqlite(services):
 
 
 # --------------------------------------------------------------------------- model routing
+
 
 def test_session_model_prefers_the_role_override_then_the_default():
     from ba_agent.services import session_model
@@ -253,11 +337,12 @@ def test_sandbox_resolves_relative_reads_against_every_root(tmp_path):
 
     sandbox = Sandbox(writable_roots=[outputs, data])
 
-    assert sandbox.resolve("guide.md").parent == data.resolve()   # found in the second root
+    assert sandbox.resolve("guide.md").parent == data.resolve()  # found in the second root
     assert sandbox.resolve("new.md", write=True).parent == outputs.resolve()  # writes use the primary root
 
 
 # --------------------------------------------------------------------------- cli console encoding
+
 
 def test_cli_reports_survive_a_legacy_windows_console(monkeypatch):
     """A cp1252 console used to raise UnicodeEncodeError while printing the doctor report and the
@@ -297,6 +382,7 @@ def test_cli_reports_survive_a_legacy_windows_console(monkeypatch):
 
 # --------------------------------------------------------------------------- thinking-model output starvation
 
+
 async def test_stream_text_retries_uncapped_when_the_budget_is_spent_on_reasoning(config, monkeypatch):
     """A thinking model (e.g. Qwen3 via LM Studio) can spend its entire max_tokens budget on internal
     reasoning and end the stream with zero visible content and no error. The gateway must retry once
@@ -318,11 +404,13 @@ async def test_stream_text_retries_uncapped_when_the_budget_is_spent_on_reasonin
             caps_seen.append(self.cap)
             if self.cap is not None:
                 return  # budget spent on invisible reasoning → empty stream, no error
-            yield SimpleNamespace(content="The system shall let brokers submit claims online.",
-                                  additional_kwargs={})
+            yield SimpleNamespace(content="The system shall let brokers submit claims online.", additional_kwargs={})
 
-    monkeypatch.setattr(gateway, "chat",
-                        lambda model, temperature=None, max_output_tokens=None, streaming=False: _FakeRun(max_output_tokens))
+    monkeypatch.setattr(
+        gateway,
+        "chat",
+        lambda model, temperature=None, max_output_tokens=None, streaming=False: _FakeRun(max_output_tokens),
+    )
 
     warnings: list[dict] = []
 
@@ -355,8 +443,11 @@ async def test_stream_text_does_not_retry_when_output_arrives(config, monkeypatc
             caps_seen.append(self.cap)
             yield SimpleNamespace(content="A perfectly good section body.", additional_kwargs={})
 
-    monkeypatch.setattr(gateway, "chat",
-                        lambda model, temperature=None, max_output_tokens=None, streaming=False: _FakeRun(max_output_tokens))
+    monkeypatch.setattr(
+        gateway,
+        "chat",
+        lambda model, temperature=None, max_output_tokens=None, streaming=False: _FakeRun(max_output_tokens),
+    )
 
     result = await gateway.stream_text(system_prompt="s", user_prompt="u", max_output_tokens=2048)
 
@@ -366,13 +457,16 @@ async def test_stream_text_does_not_retry_when_output_arrives(config, monkeypatc
 
 # --------------------------------------------------------------------------- markdown cleanup / JSON envelope
 
+
 def test_clean_markdown_unwraps_a_json_envelope():
     """Some models wrap a plain-Markdown answer in {section_id, markdown} despite instructions."""
     import json as _json
 
     from ba_agent.schemas import clean_markdown
 
-    payload = _json.dumps({"section_id": "introduction", "markdown": "### Purpose\nThe system shall do things properly."})
+    payload = _json.dumps(
+        {"section_id": "introduction", "markdown": "### Purpose\nThe system shall do things properly."}
+    )
     assert clean_markdown(payload) == "### Purpose\nThe system shall do things properly."
 
 
@@ -390,3 +484,13 @@ def test_clean_markdown_leaves_plain_prose_alone():
 
     text = "### Purpose\nThe system shall do things properly, with tables and lists."
     assert clean_markdown(text) == text
+
+
+def test_session_state_rejects_binary_diagram_payloads():
+    """The state is persisted as JSON, so a raw image in a diagram dict must fail at construction — not
+    silently at save time, where the traceback points at the wrong layer."""
+    from ba_agent.schemas import SessionState
+
+    SessionState(session_id="ok", brief="b", diagrams=[{"title": "t", "png_path": "d.png"}])
+    with pytest.raises(ValueError, match="raw bytes"):
+        SessionState(session_id="bad", brief="b", diagrams=[{"title": "t", "png": b"\x89PNG\r\n\x1a\n"}])

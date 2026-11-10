@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 _FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(?P<body>.*?)```", re.S)
 _SMART_QUOTES = {"\u201c": '"', "\u201d": '"'}
@@ -199,8 +200,12 @@ def extract_json(text: str | None) -> Any | None:
         return value
 
     repaired = [_fix_common(c) for c in faithful if c]
-    for transform in (_identity, _escape_inner_newlines, _single_to_double,
-                      lambda t: _escape_inner_newlines(_single_to_double(t))):
+    for transform in (
+        _identity,
+        _escape_inner_newlines,
+        _single_to_double,
+        lambda t: _escape_inner_newlines(_single_to_double(t)),
+    ):
         value = _first_parsed([transform(c) for c in repaired])
         if value is not None:
             return value

@@ -8,9 +8,14 @@ server:
   cors_origins:
     - "http://127.0.0.1:8765"
     - "http://localhost:8765"
+  # Empty = no auth (fine on localhost). Set BA_AGENT_TOKEN before exposing this to a network;
+  # every /api/* call then needs `Authorization: Bearer <token>`.
+  auth_token: ""
+
 
 # Which backend the agents call: lmstudio | strata (local Strata server on the 5090).
-provider: lmstudio
+# strata is the default so the app runs on the same model lane (q2_0) the AutoGen version uses.
+provider: strata
 
 lmstudio:
   base_url: "http://127.0.0.1:1234/v1"     # OpenAI-compatible endpoint
@@ -22,23 +27,28 @@ lmstudio:
   default_model: null                       # null → first *loaded* chat model (pick it in the UI instead)
   embedding_model: "text-embedding-nomic-embed-text-v1.5"   # must be downloaded/available in LM Studio
   structured_output_method: auto            # auto | json_schema | function_calling | prompt
+  structured_output_rungs: []               # explicit rung order, e.g. ["function_calling", "prompt"]; [] = probe the model
   max_retries: 2                            # retries per method before falling to the next rung
+  parallel_tool_calls: false                # local Qwen truncates a batched tool call mid-payload
 
 strata:
   base_url: "http://127.0.0.1:47831/v1"   # OpenAI-compatible endpoint, no key needed
   api_key: "strata"                         # placeholder; never a real credential
-  request_timeout_s: 300
+  request_timeout_s: 120                    # per-chunk read timeout, not total wall time: a streamed
+                                          # call that keeps emitting tokens is never cut off by it
   connect_timeout_s: 10
   max_concurrency: 1
   default_model: "q2_0"                     # Qwen3.8-Flash-Next Q2_0
   embedding_model: null                     # Strata serves no embeddings -> BM25-only retrieval
   structured_output_method: auto            # q2_0 supports json_schema and tool calling
+  structured_output_rungs: []               # explicit rung order; [] = probe the model and learn what works
   max_retries: 2
+  parallel_tool_calls: false                # same reason as above: one tool call at a time
 
-# Per-role model + sampling overrides. `model: null` means "use lmstudio.default_model".
+# Per-role model + sampling overrides. `model: null` means "use the active provider's default_model".
 # Tip on small hardware: a fast 8B for interview/triage and a bigger one for writer/use_cases works well.
 #
-# Note on max_output_tokens: thinking models (e.g. Qwen3 served by LM Studio) spend thousands of tokens on
+# Note on max_output_tokens: thinking models (q2_0 on Strata, Qwen3 in LM Studio) spend thousands of tokens on
 # internal reasoning before any visible output — a small cap starves them and the section comes back empty.
 # Keep these generous; if a capped call still returns nothing visible, the gateway retries once without a cap.
 roles:
@@ -51,16 +61,20 @@ roles:
   glossary:        { temperature: 0.3 }
   critic:          { temperature: 0.1 }
   diagrammer:      { temperature: 0.3 }
-  mermaid_reviewer:{ temperature: 0.1 }
+  mermaid_reviewer: { temperature: 0.1 }
+  human:          { temperature: 0.2 }
 
 interview:
   max_questions_per_subject: 2   # hard cap per subject (initial question + one follow-up)
   min_subjects: 4
-  max_subjects: 9
+  max_subjects: 10               # keep in sync with src/ba_agent/config.py InterviewConfig
   max_gap_rounds: 2              # clarification rounds after the agenda interview
   max_gap_questions_per_round: 3
   max_summary_rejections: 2      # "request changes" at the approval gate; after that the notes go to drafting
   max_total_questions: 40        # absolute ceiling so a run can never stall
+  max_transcript_chunks: 24      # transcript mode: chunks of an uploaded transcript to triage
+  transcript_chunk_chars: 1200
+  subject_coverage_threshold: 2  # transcript evidence units before a subject counts as already answered
 
 review:
   max_review_rounds: 2           # writer↔critic iterations; leftovers ship as open questions
@@ -70,6 +84,9 @@ review:
 diagram:
   max_revision_rounds: 1
   max_diagrams: 3
+  local_renderer: true           # render SVG/PNG with local mermaid-cli (`mmdc`) when installed
+  render_timeout_seconds: 120
+  emit_png: false                # a second mmdc invocation per diagram; off unless you need the raster
   # Optional external Mermaid renderer/parser (e.g. https://kroki.io). Disabled by default because it
   # would send your specification to a third party. The browser renders diagrams locally regardless.
   validator_url: null
@@ -78,6 +95,7 @@ knowledge:
   docs_dir: data                 # drop PDFs / DOCX / MD / TXT here, then "Index data/" in the UI
   chunk_size: 900
   chunk_overlap: 140
+  heading_aware: true            # chunk on markdown headings (langchain-text-splitters)
   top_k: 6
   min_score: 0.05
   embed_batch_size: 16
