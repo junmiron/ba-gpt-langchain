@@ -5,11 +5,11 @@
 ## Current status
 
 - **Project:** `D:\Code\Ba_gpt\Ba_langchain` — the LangChain rewrite.
-- **Branch / HEAD:** `main` / `387da7f` (`REDESIGN_PLAN: mark Phase 0 done with evidence; align Phase 1 and architecture with the no-LangGraph decision`).
-- **Working tree:** clean at handoff creation. No code changes were made for this handoff; the untracked `uv.lock` generated during verification was removed.
-- **Phase 0 is complete.** The plan records the offline suite growing from 58 to 167 tests.
-- **Next planned work: Phase 1 — LangChain-core idioms.** Phase 2 deliverables and Phase 3 parity remain pending.
-- `docs/REDESIGN_PLAN.md` is the implementation plan, but still contains stale/redundant references called out below. Reconcile those before treating every paragraph as current.
+- **Version:** 1.0.0. See `CHANGELOG.md` for what shipped.
+- **Phases 0–3 are complete.** Phase 4 (LangGraph engine) is dropped. Only the Phase 5 release pass and the optional real-model validations below remain.
+- **Suite:** **590 passed in ~86 s** offline. `ruff check`, `ruff format --check`, `mypy src` (39 source files) and `node --check src/ba_agent/web/app.js` are all clean.
+- **Real-model runs:** two full end-to-end runs against Strata `q2_0` completed with `E2E RESULT: PASS`, covering `--request-changes-first`, `--rag` and the post-delivery chat-tool path. Both produced a 29–30 page Typst PDF that passed the QA gate with zero warnings.
+- **Dead config:** 0 dead of 57 declared fields — every config key is read.
 
 ## Repository boundary — important
 
@@ -25,17 +25,11 @@
 3. **Keep the hand-rolled LangChain-core tool loop.** Refactor toward reusable core `Runnable` composition only where it clarifies the code; do not hand orchestration to an agent factory that introduces LangGraph.
 4. **PDF direction is decided:** Typst-native, hand-generated `.typ` (no pandoc in the new PDF path); ReportLab + svglib is the pure-Python fallback. Bake-off evidence is in `docs/REDESIGN_PLAN.md` §3.3.
 5. **Transcript ingestion is approved for Phase 3.** Deliverables (Phase 2) precede feature parity work.
-6. **Security scope:** localhost hardening shipped in Phase 0; token authentication is deferred unless non-local deployment is approved.
+6. **Security scope:** localhost hardening shipped in Phase 0; optional bearer-token auth shipped in Phase 5, off by default. LAN exposure beyond the token gate still needs approval.
 7. **Optional MCP integration is not Phase 1 scope.** Do not add beta MCP dependencies or LangGraph-based tooling without separate approval.
 8. **Preserve provider abstraction.** LM Studio remains supported; Strata was added as a first-class profile and UI labels now follow the active provider.
 
 ## Completed work
-
-### Baseline
-
-- Business Analyst workflow: vanilla-JS web SPA + FastAPI/SSE service, SQLite persistence, deterministic async workflow, Jinja2 prompts, model gateway, local knowledge retrieval, Mermaid generation, and export.
-- Original architecture and old AutoGen analysis: `docs/DESIGN.md`, `docs/ANALYSIS.md`.
-- The old `HANDOFF.md` captured code maps, invariants, environment notes, real-model defect history, and system-specific execution quirks. Its baseline/test count and repository-boundary statements are stale; use this file as the authoritative current handoff.
 
 ### Phase 0 — Stabilize (complete, 2026-11-07)
 
@@ -44,77 +38,82 @@
 - Hardened server, persistence, and security: SSE replay/cursor behavior, CSRF/CORS/SSRF protections, upload guards, schema versioning, event retention and related tests (`b55afa8`).
 - Added GitHub Actions CI: offline pytest on Python 3.11 and 3.13; no model, LM Studio, or external URLs are needed. See `.github/workflows/ci.yml`.
 - Marked Phase 0 done and corrected the architectural decision in `docs/REDESIGN_PLAN.md` (`387da7f`).
-- Recorded offline suite result after Phase 0: **167 passed**. Re-run to establish a fresh baseline before changing code.
+- Suite grew from 58 to 167 tests.
 
-### Real-model and deliverable research
+### Phase 1 — LangChain-core idioms (complete, 2026-11-09)
 
-- Earlier LangChain baseline work included real LM Studio runs and regression fixes for thinking-model empty output, prompt/consumer contract mismatch, and other defects; see `docs/DESIGN.md` §12–§13 and the historical notes in git.
-- A four-engine PDF bake-off is documented in `docs/REDESIGN_PLAN.md` §3.3. Decision: hand-written Typst is the target; do not copy the sibling's pandoc-based route into the new architecture.
-- No Phase 1, Phase 2, or Phase 3 implementation is recorded after Phase 0.
+- `agent_loop.py` is a `RunnableSequence`: context policy → model step → tool executor.
+- Structured output walks a per-profile rung ladder: `json_schema` → `function_calling` → prompt + repair. LM Studio and Strata declare their own rung order.
+- `retriever.py` exposes the SQLite knowledge base as a `langchain-core` `BaseRetriever`; the synchronous path is keyword-only so it never blocks on an embedding call.
+- Heading-aware chunking via `langchain-text-splitters` when installed, with a pure-Python fallback that needs no extra package.
+- `prompt_context.py` declares a typed context contract per template, and a test calls Jinja's `undeclared_variables()` on every template.
+
+### Phase 2 — Deliverables (complete, 2026-11-09)
+
+- Typst-native PDF from hand-generated `.typ` (no pandoc): `#outline()` TOC, native tables, banded figures. `scripts/fetch_typst.py` downloads the binary into gitignored `vendor/`; discovery order is `BA_TYPST_BIN` → PATH → `vendor/typst/**/typst(.exe)`.
+- ReportLab fallback with bookmarks and a TOC, embedding diagrams as **vector paths** — `rlPyCairo` is absent in this environment, so nothing is rasterised.
+- Self-contained HTML deliverable with a Contents block whose anchors are verified to resolve.
+- `pdf_qa.json` records what the gate checked: pages, outline entries, clickable Contents links, missing requirement ids, Markdown leakage, band-cut weight.
+- Band-cut safety is a geometry ink weight (1 per connector stroke, 3 per node box or label), not a dark-pixel count; warning threshold is weight > 6. Cuts snap to the quietest row in a half-band window.
+
+### Phase 3 — Feature parity (complete, 2026-11-09)
+
+- Transcript ingestion → triage → ledger → gap-only interview. Only subjects with enough transcript evidence (`interview.subject_coverage_threshold`, default 2) are skipped.
+- Lessons store: frequency-ranked `(kind, text)` rows with `seen_count`, injected as pinned context into the next plan prompt. Only generalisable signals are recorded — never project-specific ids or section names.
+- UI: rename, delete (removes the artefact folder), pagination, live refresh, busy indicator, export zip, ledger editing (a finished session reopens at DELIVER and rebuilds), settings page with model lanes, transcript attach.
+- Schema version 3 with conditional `ALTER TABLE` migrations.
+- Invariant: `status == WAITING_USER` iff `awaiting` is ANSWER/APPROVAL, enforced and tested (`tests/test_status_invariant.py` inspects every persisted snapshot).
+- Diagram PNGs are written to disk and referenced by `png_path`; the schema rejects raw image bytes in state.
+
+### Phase 5 — Release pass (in progress)
+
+- Version bumped to 1.0.0; `CHANGELOG.md` written.
+- Optional bearer-token auth shipped (`server.auth_token` / `BA_AGENT_TOKEN`), off by default. The static UI stays reachable so it can prompt for the token; SSE takes the token as a query parameter because `EventSource` cannot set headers.
+- Raw artefact hashes are computed on bytes, not decoded text — a PNG hashed through a lossy decode is not a dedup key.
+- Config synchronised with `config.yaml`; dead-config sweep reports 0 dead of 57.
+
+### Follow-up usability pass (2026-11-10)
+
+- Fixed suggestion-chip contrast, timeline card shrinking/scroll hijacking, and approval-vs-answer confusion; history restore now pages beyond 1,500 events.
+- Added accessible phase/elapsed “Thinking” status and a Human lane that defaults to real input; model-backed stakeholder replies are labeled and marked in the generated FSD, while approval remains human.
+- Structured-call trace records role, step, model, output method, elapsed time, attempts, and character counts without prompt contents. A covered-answer probe can now include the next subject question, skipping a separate model round trip with the existing question/budget guards and generator fallback.
+- One live Strata covered-answer probe emitted two successful calls (triage + coverage/next question); local model variance is high, so do not treat a single turn as a controlled latency benchmark.
 
 ## Remaining work
 
-### Phase 1 — LangChain-core idioms (next implementation phase)
+- **Tag + GitHub release.** `git remote -v` is empty — there is no remote configured, so `v1.0.0` cannot be pushed or tagged from here. Add a remote, then tag.
+- **Real LM Studio run.** Not yet done: `curl http://127.0.0.1:1234/v1/models` → exit 7 (LM Studio not running). Run `scripts/e2e_lmstudio.py --provider lmstudio` when a chat model is loaded, to confirm the provider-specific rung ladder on a second backend.
+- **Vector retrieval is BM25-only under Strata** (no embedding endpoint). It works, but the UI should say so per provider rather than implying semantic search.
+- **Real-model runs are slow** (~25–35 min for a full interview on a local quantised model). Budget `--deadline-minutes` accordingly; the driver now nudges stalled sessions via `/api/sessions/{id}/resume`.
+- `docs/REDESIGN_PLAN.md` Part 2 still has proposal-era prose (rows describing `create_agent` and LangGraph as open decision points). Part 6 closes those decisions; the prose is historical and safe to trim, and nothing in it is implemented.
 
-Approved scope from `docs/REDESIGN_PLAN.md` §4 Phase 1:
+## Explicitly dropped / deferred
 
-- Keep the deterministic workflow and hand-rolled tool loop; any core runnable composition must be a thin, testable refactor, not an abstraction project.
-- Reconcile structured-output selection with existing provider profiles and preserve the tested fallback ladder (schema mode → tool/function calling → prompt/repair as applicable).
-- Expose local knowledge through a `langchain-core` Retriever interface while retaining the current hybrid retrieval implementation. Use `langchain-text-splitters` for heading-aware chunking only if needed and approved as a dependency change.
-- Add typed prompt-context contracts and a test that detects undeclared Jinja variables.
-- Preserve the scripted-gateway harness, deterministic behavior, artifact output, bounded loops, and visible degraded-mode warnings.
-- **Never add `langgraph`, `langchain.agents.create_agent`, or orchestration that transfers workflow ownership to LangGraph.**
+- **Phase 4 LangGraph engine is dropped.** Do not implement it.
+- MCP adapter/beta integration is deferred; it is not required.
+- LAN exposure beyond the token gate is deferred until a deployment scope is approved.
 
-Acceptance from the plan: offline tests remain green; focused runnable/retriever/context-contract tests are added; workflow and artifact behavior remain unchanged. Ask before dependency or persisted-schema changes.
+## Verification snapshot (2026-11-10)
 
-### Phase 2 — Deliverables
+Run each gate separately and read the output — passing pytest does not imply the lint, format or type gates pass.
 
-- Implement the approved Typst-native renderer in this repo, generating `.typ` directly from the spec/Markdown model without pandoc.
-- Vendor the approved Typst executable and fonts as planned; retain ReportLab + svglib as fallback.
-- Add deterministic Mermaid render/export handling and self-contained HTML with linked TOC/inline SVG.
-- Add no-model-call PDF/HTML/Markdown generation and PDF QA: TOC/bookmarks, all FR/NFR rows, diagram-band cut safety, and no raw Markdown leakage. Full acceptance thresholds are in `docs/REDESIGN_PLAN.md` §4 Phase 2.
+| Gate | Command | Result |
+|---|---|---|
+| Tests | `uv run pytest -q` | 590 passed, 1 deselected |
+| Lint | `uv run ruff check src tests scripts` | All checks passed |
+| Format | `uv run ruff format --check src tests scripts` | clean |
+| Types | `uv run mypy src` | no issues in 39 source files |
+| UI syntax | `node --check src/ba_agent/web/app.js` | OK |
+| Offline acceptance | `uv run python scripts/e2e_offline.py` | exit 0 |
+| Live acceptance | `uv run python scripts/e2e_live.py --base http://127.0.0.1:8769` | 43 checks passed, 0 failed |
+| Real model | `uv run python scripts/e2e_lmstudio.py --provider strata --request-changes-first --rag` | PASS |
 
-### Phase 3 — Feature parity
-
-- Transcript upload/ingestion → triage/ledger → gap-only interview.
-- Configuration UI for role/model lanes, budgets, and knowledge directories.
-- Feedback/lessons store injected into future interview/writer context. Describe it accurately as feedback/retrieval, not reinforcement learning unless a reward/policy-learning mechanism is actually implemented.
-- UI gaps: delete/rename sessions, export, ledger editing, busy state, pagination/live updates.
-- Validate parity against the AutoGen sibling without changing that repository; add e2e transcript-mode coverage.
-
-### Explicitly dropped / deferred
-
-- **Phase 4 LangGraph engine is dropped**, despite stale text in the plan still describing it as optional. Do not implement it.
-- MCP adapter/beta integration is deferred; it is not required for Phase 1 or 2.
-- LAN exposure/authentication is deferred; keep the service localhost-only unless the user approves a deployment scope.
-- Optional validations in the historical handoff: real-model `--request-changes-first` run, RAG with an indexed document, and post-delivery chat-tool smoke test. Prioritize if the user requests them and model time is available.
-
-## Plan cleanup needed before/alongside Phase 1
-
-`docs/REDESIGN_PLAN.md` was amended at `387da7f`, but still has proposal-era contradictions. Update it without changing the approved decisions:
-
-- Remove or mark dropped the Phase 4 LangGraph engine section and its LangGraph-specific risks.
-- Remove the stale “create_agent + middleware” recommendation and any text implying it can be adopted; it violates the no-LangGraph rule.
-- Remove stale open-decision questions at the end: PDF, transcript ingestion, security scope, and work order have already been decided above.
-- Correct old feature-parity wording that calls the feedback store “reinforcement learning”.
-- Document the order as Phase 1 core idioms → Phase 2 deliverables → Phase 3 parity → release; do not imply LangGraph work.
-
-Keep this reconciliation documentation-only and small; do not silently broaden it into implementation.
-
-## Verification snapshot (2026-11-09)
-
-- `uv sync --extra dev`: succeeded and restored the project venv with declared development extras. It generated an untracked `uv.lock`; that file was removed because it was absent/untracked before the check.
-- `uv run pytest -q`: **167 passed in 25.03s**. Pytest-asyncio emitted a warning that the default async fixture loop scope is unset.
-- `uv run ruff format --check src tests`: **failed** — 33 files would be reformatted. No files were changed to address this during handoff.
-- `uv run ruff check src tests`: **failed with 105 findings** across source and tests under the currently available rules.
-- `uv run mypy src`: **unavailable** (`mypy` executable is not installed in the project environment).
-- Working tree was clean after removing the incidental `uv.lock`; `.venv/` is ignored.
-
-Run gates individually and read their output. Passing pytest does not imply formatting, lint, or type gates pass.
+`uv sync --extra dev` regenerates an untracked `uv.lock`; it is not committed.
 
 ## Commands and conventions
 
 - From `D:\Code\Ba_gpt\Ba_langchain`, use `uv sync --extra dev` to create/update the environment, then `uv run pytest -q`.
+- `pyproject.toml` sets `addopts = "-m 'not live'"`, so the default run never touches a model server. Run the live smoke test explicitly with `uv run pytest -m live` when a provider is up.
 - CI installs `pip install -e ".[dev]"` and runs `pytest -q` on Python 3.11 and 3.13.
 - Run `uv run ruff format --check src tests`, `uv run ruff check src tests`, and `uv run mypy src` separately; baseline results are above.
 - Read `docs/REDESIGN_PLAN.md` and `docs/DESIGN.md` before architectural edits. Inspect relevant code/tests first.
@@ -124,6 +123,6 @@ Run gates individually and read their output. Passing pytest does not imply form
 
 ## First next step
 
-1. Read this handoff and reconcile the stale decisions in `docs/REDESIGN_PLAN.md` as listed above.
-2. Re-run `uv run pytest -q` (expected baseline: 167 tests) and record the actual result.
-3. Start Phase 1 with a scoped test/design pass around `src/ba_agent/agent_loop.py`, `models.py`, `knowledge.py`, and `prompts.py`; retain the workflow machine and artifact behavior. Add focused tests before refactoring and do not add dependencies without approval.
+1. Add a git remote, then tag `v1.0.0` and cut the release.
+2. Run one real LM Studio pass when a chat model is loaded, to confirm the rung ladder on a second backend.
+3. Everything else is polish, not pending work.

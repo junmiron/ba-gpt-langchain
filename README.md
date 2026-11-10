@@ -1,4 +1,4 @@
-# BA Agent — Business Analyst interview agent (LangChain + LM Studio)
+# BA Agent — Business Analyst interview agent (LangChain + a local model server)
 
 A local-first requirements elicitation agent. You describe a project; it interviews you subject by subject,
 builds a traceable requirements ledger, gets your approval on a summary, then writes a **Functional
@@ -15,7 +15,8 @@ machine, and the interactive chat channel is a hand-written `bind_tools` loop.
 
 ## Quick start
 
-Requirements: Python 3.11+, and [LM Studio](https://lmstudio.ai) running with the REST API enabled
+Requirements: Python 3.11+, and a local OpenAI-compatible model server — **Strata** (`:47831`, the default,
+the lane the AutoGen version runs on) or [LM Studio](https://lmstudio.ai) (`:1234`)
 (Settings → Developer → *Serve REST API*, default port `1234`). At least one chat model downloaded.
 
 ```bash
@@ -26,7 +27,7 @@ uv venv .venv --python 3.13
 .venv\Scripts\activate
 uv pip install -e ".[dev]"        # or: pip install -e ".[dev]"
 
-# 2. check that LM Studio is reachable and see which models the UI will offer
+# 2. check that the configured provider is reachable and see which models the UI will offer
 python -m ba_agent doctor
 
 # 3. start the app
@@ -49,11 +50,26 @@ Everything lands in `outputs/<session-id>/`:
 | File | What it is |
 |---|---|
 | `functional_specification.md` | The FSD: 10 sections, assembled deterministically from the ledger |
-| `process_diagram.mmd` (+ `.svg` if a renderer is enabled) | Mermaid process flow(s), syntax-validated |
+| `functional_specification.pdf` | Typeset PDF — Typst if a `typst` binary is found, otherwise ReportLab |
+| `functional_specification.typ` | The Typst source the PDF was built from (only when Typst is available) |
+| `process_diagram_1.mmd` / `.svg` | Mermaid process flow(s), syntax-validated; SVG rendered by local `mmdc` if installed |
 | `interview.jsonl` | Every question/answer pair — the audit trail |
-| `summary.md` | The approved requirements summary |
-| `deliverable.html` | Self-contained, styled, print-to-PDF bundle (diagrams rendered inline) |
-| `metadata.json` | Run stats: model calls, wall/model seconds, budgets consumed, open issues |
+| `requirements_summary.md` | The approved requirements summary |
+| `deliverable.html` | Self-contained, styled, printable bundle with a linked Contents block |
+| `transcript.txt` | The elicitation transcript the run was seeded from (transcript mode only) |
+| `pdf_qa.json` | What the QA gate actually verified: pages, outline entries, clickable Contents links, missing requirement IDs, Markdown leakage, diagram band cuts |
+| `metadata.json` | Run stats: model calls, wall/model seconds, budgets consumed, open issues, and which PDF engine produced the file |
+
+Press **Download all (.zip)** in the **Files** tab to hand the whole bundle to a stakeholder.
+
+To get a real PDF, install Typst (or put `typst.exe` anywhere and set `BA_TYPST_BIN`):
+
+```bash
+python scripts/fetch_typst.py     # downloads typst.exe into vendor/typst/ (gitignored)
+```
+
+Without Typst the fallback is pure-Python ReportLab + svglib — same deliverable, with diagram bands embedded
+as vector paths (no rasterising, so no extra rendering backend is required).
 
 ---
 
@@ -85,6 +101,10 @@ The five ideas worth knowing, inherited from what went wrong in v1:
    questions, model timeouts, and one global concurrency slot so two requests never fight for VRAM. A stuck run
    terminates with a reason instead of running forever.
 
+A transcript changes *where the questions go*, not *whether there are questions*: `subject_coverage_threshold`
+counts evidence units (excerpt x distinct subject term) per agenda subject, and only subjects that clear it are
+closed. A transcript that only talked about volumes still gets asked about scope.
+
 Deterministic checks also *precede* the LLM: spec completeness is linted in code (sections present, requirement
 counts, acceptance criteria, traceability), Mermaid syntax is validated by a Python parser before any reviewer
 sees it, and the title page / open questions / traceability appendix are rendered from the ledger rather than
@@ -99,6 +119,10 @@ it. Model choice can also be changed at runtime in the UI and is persisted.
 
 | Setting | Default | Notes |
 |---|---|---|
+| `provider` | `strata` | `strata` (q2_0 on the 5090) or `lmstudio`; also `BA_PROVIDER`, `--provider`, or Settings |
+| `strata.base_url` | `http://127.0.0.1:47831/v1` | OpenAI-compatible endpoint, no key required |
+| `strata.default_model` | `q2_0` | Qwen3.8-Flash-Next NVFP4 on the 5090 |
+| `strata.embedding_model` | `null` | Strata serves no embeddings → retrieval is BM25 only |
 | `lmstudio.base_url` | `http://127.0.0.1:1234/v1` | OpenAI-compatible endpoint (`LMSTUDIO_BASE_URL`) |
 | `lmstudio.admin_url` | `…/api/v0` | Powers the dropdown: load state, tool support, context length |
 | `lmstudio.default_model` | `null` → first **loaded** chat model | Set in the UI dropdown instead (`BA_MODEL`) |
@@ -132,19 +156,32 @@ python -m ba_agent export   <session-id>                       # re-assemble del
 | | |
 |---|---|
 | `GET /api/health` · `GET/POST /api/models` | status, catalog, default + per-role models |
-| `GET/POST /api/sessions` · `GET/DELETE /api/sessions/{id}` | session lifecycle |
+| `GET/POST /api/sessions` · `GET/PATCH/DELETE /api/sessions/{id}` | session lifecycle (`PATCH` renames; `DELETE` also removes the artefact folder) |
 | `POST /api/sessions/{id}/answer` · `/approve` · `/resume` · `/cancel` · `/chat` | commands (return immediately; progress arrives over SSE) |
 | `GET /api/sessions/{id}/stream` | SSE, honours `Last-Event-ID` for lossless reconnects |
 | `GET /api/sessions/{id}/events?after=N` | persisted event replay (the UI rebuilds the timeline from this) |
 | `POST /api/knowledge/upload` · `/index` · `/search` · `GET /api/knowledge/status` | knowledge base |
-| `GET /api/artifacts/{id}/{name}` | download a deliverable |
+| `GET /api/artifacts/{session_id}/{name}` | download one deliverable |
+| `GET /api/sessions/{id}/export` | the whole bundle as a zip |
+| `PATCH /api/sessions/{id}/ledger/{item_id}` | edit a ledger row; on a finished run this rebuilds the deliverables |
+| `GET/PATCH /api/settings` | budgets, retrieval, diagram and model-lane settings |
+| `POST /api/settings/reset` | discard every override and return to the values the server started with |
+| `GET /api/lessons` | the feedback store, ranked by how often it has recurred |
+
+Every `/api/*` route is open by default. Set `server.auth_token` (or `BA_AGENT_TOKEN`, minimum 16 characters) and
+the API requires `Authorization: Bearer ***` — `x-api-key` and, for SSE only, `?token=*** are also accepted,
+because `EventSource` cannot send headers. The static UI stays reachable so it can prompt for the token.
 
 ---
 
 ## Tests
 
 ```bash
-python -m pytest -q          # 52 tests, ~6 s — no model, no VRAM, no network
+python -m pytest -q          # 590 tests, ~86 s — no model, no VRAM, no network
+python -m pytest -m live       # the one smoke test that talks to a real provider, only when one is up
+uv run ruff check src tests scripts && uv run ruff format --check src tests scripts
+uv run mypy src              # 39 source files, strict
+node --check src/ba_agent/web/app.js
 ```
 
 The suite drives the real state machine and the real HTTP/SSE surface against a scripted gateway
@@ -155,7 +192,7 @@ loading anything. `docs/DESIGN.md` explains what each layer guarantees.
 
 ## Troubleshooting
 
-**"No LM Studio chat model available."** — Nothing is loaded in LM Studio. Load a model (or pick one in the
+**"No chat model available."** — The configured provider has nothing loaded. For LM Studio, load a model (or pick one in the
 dropdown) and press **Resume**; the run continues from the phase it stopped in, nothing is lost.
 
 **Repeated "structured output failed … retrying"** — normal for small quantised models: the gateway is walking
@@ -163,7 +200,7 @@ down its ladder. If every rung fails the step degrades visibly (a warning card) 
 placeholder or the deterministic fallback instead of dying. Pinning `structured_output_method: prompt` often
 helps models that mangle tool-call schemas.
 
-**Vector search off / "BM25 only"** — no embedding model in LM Studio, or `/v1/embeddings` unsupported. Keyword
+**Vector search off / "BM25 only"** — the provider has no embedding model (Strata serves none) or `/v1/embeddings` is unsupported. Keyword
 retrieval still works; download an embedding model and re-index to enable vectors.
 
 **A step seems slow** — switching models unloads/reloads weights, which can take minutes on a big GGUF. The UI
@@ -176,12 +213,13 @@ exhaust the role's `max_output_tokens` budget. The gateway retries once without 
 but expect ~5 min per section. For faster runs, assign a non-thinking model to the writer/use_cases roles via ⋯ →
 per-role overrides.
 
-**Diagrams don't render as SVG files** — the browser renders Mermaid locally from vendored JS, and the `.mmd`
-source ships in the bundle. Server-side SVG requires enabling `diagram.validator_url`.
+**Diagrams don't render as SVG files** — server-side SVG needs `mermaid-cli` (`npm i -g mermaid-cli`) or a
+`diagram.validator_url`. Without either, the `.mmd` source still ships in the bundle and the browser renders it
+locally from the vendored JS; the PDF simply omits that figure and the QA report says so.
 
 ---
 
 ## Privacy
 
-Every model call goes to LM Studio on your machine. Nothing is sent anywhere else unless you explicitly set
+Every model call goes to your local model server (Strata or LM Studio). Nothing is sent anywhere else unless you explicitly set
 `BA_KROKI_URL`, or add external URLs to the knowledge base (which fetches those pages).
