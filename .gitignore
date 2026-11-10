@@ -20,6 +20,8 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.coverage
+htmlcov/
 .ruff_cache/
 
 # node / editors
@@ -27,3 +29,8 @@ node_modules/
 .DS_Store
 .idea/
 .vscode/
+
+# vendored binaries (Typst is downloaded on demand; see src/ba_agent/artifacts/typst.py)
+vendor/
+scratch_pdf/
+scratch_e2e/
