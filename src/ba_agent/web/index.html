@@ -28,6 +28,7 @@
     <div class="side-section">
       <div class="side-title">Sessions</div>
       <ul id="session-list" class="session-list"><li class="empty">loading…</li></ul>
+      <div id="session-pager" class="session-pager" hidden></div>
     </div>
 
     <div class="side-section grow">
@@ -58,6 +59,7 @@
           <select id="model-select" title="model used for the next step"></select>
         </label>
         <button id="btn-advanced" class="btn btn-ghost btn-sm" title="Per-role model overrides">⋯</button>
+        <button id="btn-settings" class="btn btn-ghost btn-sm" title="Run budgets">Settings</button>
         <button id="btn-resume" class="btn btn-ghost btn-sm" hidden>Resume</button>
         <button id="btn-stop" class="btn btn-danger btn-sm" hidden>Stop</button>
       </div>
@@ -65,7 +67,7 @@
 
     <nav id="stepper" class="stepper" aria-label="workflow progress"></nav>
 
-    <section id="timeline" class="timeline">
+    <section id="timeline" class="timeline" tabindex="0" aria-label="Conversation history">
       <div class="welcome">
         <h2>Business Analyst interview agent</h2>
         <p>Describe a project; the agent interviews you subject by subject, then produces an approved requirements
@@ -80,8 +82,10 @@
     </section>
 
     <footer class="composer" id="composer" hidden>
+      <div id="activity-indicator" class="activity-indicator" role="status" aria-live="polite" hidden></div>
       <div id="question-card" class="question-card" hidden></div>
-      <form id="answer-form" class="answer-form">
+      <div id="approval-card" class="question-card approval-card" hidden></div>
+      <form id="answer-form" class="answer-form" hidden>
         <textarea id="answer-input" rows="2" placeholder="Answer the question above…"></textarea>
         <div class="answer-actions">
           <button type="submit" class="btn btn-primary">Send answer</button>
@@ -120,7 +124,7 @@
   <form method="dialog" id="new-form">
     <h2>New requirements interview</h2>
     <label>Project brief
-      <textarea id="new-brief" rows="7" required placeholder="e.g. We need a portal for insurance brokers to submit and track claims. Currently everything is by email. Around 300 brokers, peak in winter, must integrate with the existing policy system (REST) and respect GDPR…"></textarea>
+      <textarea id="new-brief" rows="7" placeholder="e.g. We need a portal for insurance brokers to submit and track claims. Currently everything is by email. Around 300 brokers, peak in winter, must integrate with the existing policy system (REST) and respect GDPR…"></textarea>
     </label>
     <div class="row">
       <label>Title (optional)<input id="new-title" placeholder="Claims broker portal"></label>
@@ -129,7 +133,16 @@
     <label>Reference URLs to index first (one per line, optional)
       <textarea id="new-urls" rows="2" placeholder="https://…"></textarea>
     </label>
-    <p class="muted small">The interview starts immediately after creation. Nothing leaves your machine except indexed URLs you type here.</p>
+    <label>Meeting transcript to start from (optional)
+      <textarea id="new-transcript" rows="6" placeholder="Paste notes from a discovery call, an earlier interview or a requirements email. The agent triages it and only asks about what is missing."></textarea>
+      <span class="transcript-tools">
+        <button type="button" id="new-transcript-file-btn" class="btn btn-ghost btn-sm">Attach .txt / .md / .csv</button>
+        <input type="file" id="new-transcript-file" accept=".txt,.md,.csv" hidden>
+        <span id="transcript-count" class="muted small"></span>
+      </span>
+    </label>
+    <p class="muted small">A transcript seeds the ledger. Only the subjects it actually answers are skipped; the
+    rest are still interviewed. Nothing leaves your machine except indexed URLs you type here.</p>
     <div class="dialog-actions">
       <button value="cancel" class="btn btn-ghost">Cancel</button>
       <button value="create" class="btn btn-primary" id="new-create">Start interview</button>
@@ -150,6 +163,37 @@
   </form>
 </dialog>
 
+<dialog id="dlg-settings">
+  <form method="dialog" id="settings-form">
+    <h2>Run settings</h2>
+    <p class="muted small">Budgets cap how long the interview and review loops can run; model lanes pick which model each role uses. Both persist across restarts.</p>
+    <div id="settings-grid" class="settings-grid"></div>
+    <div class="settings-section">
+      <h3>Backend</h3>
+      <p class="muted small">Which local model server the agents call. Switching takes effect on the next step — no restart.</p>
+      <label>Provider <select id="provider-select"></select></label>
+      <div class="muted small" id="provider-base"></div>
+    </div>
+    <div class="settings-section">
+      <h3>Model lanes</h3>
+      <p class="muted small">Human defaults to real input. Selecting a model simulates stakeholder replies; summary approval always stays with you.</p>
+      <div id="settings-models" class="settings-models"></div>
+    </div>
+    <div class="settings-section">
+      <h3>Lessons from previous runs</h3>
+      <p class="muted small">Recurring gaps the engine has learned to ask about. They are pinned into the next interview plan.</p>
+      <ul id="settings-lessons" class="lessons-list"></ul>
+    </div>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-ghost">Close</button>
+      <button value="save" class="btn btn-primary" id="settings-save">Apply</button>
+      <button type="button" class="btn btn-ghost" id="settings-reset" title="Discard every override you changed in this UI and go back to the values this server started with">
+        Reset to defaults
+      </button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="dlg-reject">
   <form method="dialog" id="reject-form">
     <h2>Request changes to the summary</h2>
@@ -159,6 +203,26 @@
     <div class="dialog-actions">
       <button value="cancel" class="btn btn-ghost">Cancel</button>
       <button value="send" class="btn btn-primary">Send back to interview</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-ledger">
+  <form method="dialog" id="ledger-form">
+    <h2>Edit ledger entry</h2>
+    <label>Title<input id="ledger-title" placeholder="Requirement statement"></label>
+    <label>Details<textarea id="ledger-body" rows="4"></textarea></label>
+    <label data-field-label>Priority
+      <select id="ledger-priority">
+        <option value="must">Must</option><option value="should">Should</option>
+        <option value="could">Could</option><option value="wont">Won't</option>
+      </select>
+    </label>
+    <label data-field-label>Acceptance criteria (one per line)<textarea id="ledger-acceptance" rows="3"></textarea></label>
+    <p class="muted small">Editing the ledger clears the drafted spec so it is regenerated from the corrected entries.</p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-ghost">Cancel</button>
+      <button value="save" class="btn btn-primary">Save</button>
     </div>
   </form>
 </dialog>

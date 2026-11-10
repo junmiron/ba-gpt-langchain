@@ -22,11 +22,17 @@ const PHASES = [
 const ROLE_LABELS = {
   plan: "Planner", interview: "Interviewer", triage: "Analyst", summary: "Summariser", writer: "Spec writer",
   use_cases: "Use-case analyst", glossary: "Glossarist", critic: "Reviewer", diagrammer: "Diagrammer",
-  mermaid_reviewer: "Mermaid reviewer", chat: "BA assistant", engine: "Workflow",
+  mermaid_reviewer: "Mermaid reviewer", human: "Human", chat: "BA assistant", engine: "Workflow",
 };
+
+let activityStartedAt = 0;
+let activityPhase = "";
+let activityTimer = null;
 
 const S = {
   sessionId: null,
+  sessionOffset: 0,
+  sessionTotal: 0,
   snapshot: null,
   models: [],
   defaultModel: null,
@@ -38,6 +44,8 @@ const S = {
   openStreams: new Map(),   // key → element
   diagrams: [],
   reconnectTimer: null,
+  settings: null,
+  transcriptSource: "",
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -45,13 +53,32 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 /* ------------------------------------------------------------------ utilities */
 
+// Bearer token for the UI when `server.auth_token` is set. Stored in localStorage so a refresh does not
+// ask again; the static page itself is always served, only /api/* is gated.
+const TOKEN_KEY = "ba-agent-token";
+
+function authToken() {
+  return localStorage.getItem(TOKEN_KEY) || "";
+}
+
 async function api(path, options = {}) {
   const init = { headers: {}, ...options };
   if (init.body && !(init.body instanceof FormData)) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(init.body);
   }
+  const token = authToken();
+  if (token) init.headers["Authorization"] = `Bearer ${token}`;
   const response = await fetch(path, init);
+  if (response.status === 401) {
+    // The server wants a token we do not have yet: ask once, then retry.
+    const supplied = window.prompt("API token (server.auth_token):", "");
+    if (supplied) {
+      localStorage.setItem(TOKEN_KEY, supplied.trim());
+      return api(path, options);
+    }
+    throw new Error("the API is token-protected and no token was supplied");
+  }
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try { detail = (await response.json()).detail || detail; } catch (_) { /* keep default */ }
@@ -131,17 +158,24 @@ function card({ role = "engine", title = "", kind = "", time = "", tags = [] }) 
   return { el, body, header };
 }
 
+function timelineIsNearBottom(timeline, threshold = 160) {
+  return timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < threshold;
+}
+
 function pushCard(el) {
   const timeline = $("#timeline");
+  const followLatest = timelineIsNearBottom(timeline);
   const welcome = timeline.querySelector(".welcome");
   if (welcome) welcome.remove();
   timeline.appendChild(el);
-  timeline.scrollTop = timeline.scrollHeight;
+  if (followLatest) timeline.scrollTop = timeline.scrollHeight;
 }
 
 function closeStreams() { S.openStreams.clear(); }
 
 function appendToken(role, step, text) {
+  const timeline = $("#timeline");
+  const followLatest = timelineIsNearBottom(timeline);
   const key = `${role}:${step}`;
   let entry = S.openStreams.get(key);
   if (!entry) {
@@ -153,7 +187,7 @@ function appendToken(role, step, text) {
   }
   entry.text += text;
   entry.body.innerHTML = safeHTML(entry.text) + '<span class="streaming-caret"></span>';
-  $("#timeline").scrollTop = $("#timeline").scrollHeight;
+  if (followLatest) timeline.scrollTop = timeline.scrollHeight;
 }
 
 function finalizeStream(role, step) {
@@ -172,12 +206,21 @@ function scheduleRefresh(delay = 250) {
   refreshTimer = setTimeout(() => { refreshSnapshot().catch(() => { /* stream still authoritative */ }); }, delay);
 }
 
+let sessionListTimer = null;
+/** The sidebar shows each session's phase and busy dot, so it has to move when a run moves. */
+function scheduleSessionListRefresh(delay = 1500) {
+  clearTimeout(sessionListTimer);
+  sessionListTimer = setTimeout(() => { loadSessions().catch(() => {}); }, delay);
+}
+
 function traceLine(event) {
   const pane = $("#tab-trace");
   const line = document.createElement("div");
   line.className = "trace-line";
   const payload = event.payload || {};
-  const extra = payload.phase || payload.section_id || payload.name || payload.tool || payload.model || "";
+  const extra = payload.category === "model_call"
+    ? `${payload.role || "model"} · ${payload.step || ""} · ${payload.latency_ms || 0} ms · ${payload.method || ""} · ${payload.prompt_chars || 0} prompt chars`
+    : (payload.phase || payload.section_id || payload.name || payload.tool || payload.model || "");
   line.innerHTML = `<b>${escapeHtml(event.type)}</b> ${escapeHtml(extra)} <span class="muted">${fmtTime(event.ts)}</span>`;
   pane.appendChild(line);
   pane.parentElement.scrollTop = pane.parentElement.scrollHeight;
@@ -202,18 +245,46 @@ function renderStepper(snapshot) {
   });
 }
 
+function startActivityIndicator(phase) {
+  const box = $("#activity-indicator");
+  if (!box) return;
+  if (!activityStartedAt) activityStartedAt = Date.now();
+  activityPhase = phase || activityPhase || "workflow";
+  const labels = Object.fromEntries(PHASES.map((item) => [item.id, item.label]));
+  const update = () => {
+    const seconds = Math.floor((Date.now() - activityStartedAt) / 1000);
+    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    box.textContent = `Thinking · ${labels[activityPhase] || activityPhase} · ${elapsed}`;
+  };
+  box.hidden = false;
+  update();
+  if (!activityTimer) activityTimer = setInterval(update, 1000);
+}
+
+function stopActivityIndicator() {
+  const box = $("#activity-indicator");
+  if (activityTimer) clearInterval(activityTimer);
+  activityTimer = null;
+  activityStartedAt = 0;
+  activityPhase = "";
+  if (box) { box.hidden = true; box.textContent = ""; }
+}
+
 function renderHeader(snapshot) {
   if (!snapshot) return;
   $("#session-title").textContent = snapshot.project_name || snapshot.title || "Untitled";
   const bits = [];
   if (snapshot.objective) bits.push(snapshot.objective);
   bits.push(`${snapshot.questions_total} questions · ${snapshot.requirements_total} requirements`);
+  if (snapshot.has_transcript) bits.push(`seeded from ${snapshot.transcript_source || "a transcript"}`);
   if (snapshot.metrics && snapshot.metrics.model_seconds) {
     bits.push(`model time ${Math.round(snapshot.metrics.model_seconds)}s / ${Math.round(snapshot.metrics.calls || 0)} calls`);
   }
   $("#session-meta").textContent = bits.join(" · ");
   const waiting = snapshot.awaiting !== "none" && snapshot.phase !== "done";
   $("#composer").hidden = !snapshot;
+  if (snapshot.busy && snapshot.status === "running" && snapshot.awaiting === "none") startActivityIndicator(snapshot.phase);
+  else stopActivityIndicator();
   $("#btn-stop").hidden = !snapshot.busy;
   // An errored run is resumable by design (e.g. LM Studio was off, or a model finished loading since).
   const resumable = ["idle", "cancelled", "error"].includes(snapshot.status) && snapshot.phase !== "done";
@@ -223,9 +294,12 @@ function renderHeader(snapshot) {
 
 function renderQuestionCard(snapshot) {
   const box = $("#question-card");
+  const answerForm = $("#answer-form");
   const question = snapshot.pending_question;
-  if (!question) { box.hidden = true; box.innerHTML = ""; return; }
-  box.hidden = false;
+  const showQuestion = snapshot.awaiting === "answer" && Boolean(question);
+  answerForm.hidden = !showQuestion;
+  box.hidden = !showQuestion;
+  if (!showQuestion) { box.innerHTML = ""; renderApprovalCard(snapshot); return; }
   box.innerHTML = `
     <div class="q-subject">${escapeHtml(question.subject)} · ${escapeHtml(question.purpose)}</div>
     <div class="q-text">${escapeHtml(question.text)}</div>
@@ -238,7 +312,24 @@ function renderQuestionCard(snapshot) {
     input.value = (input.value ? input.value + " " : "") + chip.textContent.trim();
     input.focus();
   }));
+  renderApprovalCard(snapshot);
   $("#answer-input").focus();
+}
+
+function renderApprovalCard(snapshot) {
+  const box = $("#approval-card");
+  const awaitingApproval = snapshot.awaiting === "approval";
+  box.hidden = !awaitingApproval;
+  if (!awaitingApproval) { box.innerHTML = ""; return; }
+  box.innerHTML = `
+    <div class="q-subject">Summary approval required</div>
+    <div class="q-text">Review the requirements summary in the Spec panel, then choose what to do next.</div>
+    <div class="approval-actions">
+      <button type="button" class="btn btn-primary btn-sm" data-approve="yes">Approve &amp; draft the FSD</button>
+      <button type="button" class="btn btn-ghost btn-sm" data-approve="no">Request changes…</button>
+    </div>`;
+  box.querySelector('[data-approve="yes"]').addEventListener("click", () => approve(true, ""));
+  box.querySelector('[data-approve="no"]').addEventListener("click", () => $("#dlg-reject").showModal());
 }
 
 function renderSpec(snapshot) {
@@ -248,7 +339,10 @@ function renderSpec(snapshot) {
   if (markdown.trim()) {
     pane.innerHTML = safeHTML(markdown);
   } else if (snapshot.summary_markdown) {
-    pane.innerHTML = `<p class="muted">Draft not started yet — approved summary below.</p>` + safeHTML(snapshot.summary_markdown);
+    const summaryStatus = snapshot.awaiting === "approval"
+      ? "Approval required — review the summary below."
+      : "Draft not started yet — summary below.";
+    pane.innerHTML = `<p class="muted">${summaryStatus}</p>` + safeHTML(snapshot.summary_markdown);
   }
 }
 
@@ -266,28 +360,89 @@ function renderLedger(snapshot) {
       <td>${escapeHtml(r.priority || "")}</td>
       <td>${r.acceptance && r.acceptance.length ? escapeHtml(r.acceptance.join("; ")) : '<span class="tag warn">missing</span>'}</td>
       <td class="muted">${escapeHtml(r.subject || "")}${r.source_q ? " · Q" + r.source_q : ""}</td>
+      <td><button class="icon-btn" data-edit="${escapeHtml(r.id)}" title="Edit requirement">&#9998;</button></td>
     </tr>`).join("");
 
   const otherRows = others.map((i) => `<tr>
       <td><span class="tag">${escapeHtml(i.kind)}</span></td>
       <td>${escapeHtml(i.body || i.title || "")}</td>
       <td class="muted">${escapeHtml(i.subject || "")}</td>
+      <td><button class="icon-btn" data-edit="${escapeHtml(i.id)}" title="Edit entry" aria-label="Edit ledger entry">&#9998;</button></td>
     </tr>`).join("");
 
   pane.innerHTML = `
     <p class="small muted">${requirements.length} requirement(s) · ${others.length} other ledger entries</p>
     ${requirements.length ? `<table class="data"><thead><tr><th>ID</th><th>Title</th><th>Category</th><th>Priority</th><th>Acceptance</th><th>Source</th></tr></thead><tbody>${reqRows}</tbody></table>` : ""}
     ${otherRows ? `<h3 style="font-size:13px;margin-top:18px">Facts, decisions, risks</h3><table class="data"><tbody>${otherRows}</tbody></table>` : ""}`;
+  pane.querySelectorAll("[data-edit]").forEach((button) => {
+    button.addEventListener("click", () => openLedgerEditor(button.dataset.edit));
+  });
+}
+
+async function openLedgerEditor(itemId) {
+  const entry = ((S.snapshot && S.snapshot.ledger) || []).find((i) => i.id === itemId);
+  if (!entry) return;
+  const dialog = $("#dlg-ledger");
+  if (!dialog) return;
+  dialog.dataset.itemId = itemId;
+  dialog.dataset.kind = entry.kind || "";
+  $("#ledger-title").value = entry.title || "";
+  $("#ledger-body").value = entry.body || "";
+  $("#ledger-priority").value = entry.priority || "must";
+  $("#ledger-acceptance").value = (entry.acceptance || []).join("\n");
+  const isRequirement = entry.kind === "requirement";
+  $("#ledger-priority").hidden = !isRequirement;
+  $("#ledger-acceptance").hidden = !isRequirement;
+  $$("[data-field-label]").forEach((el) => { el.hidden = !isRequirement; });
+  dialog.showModal();
 }
 
 function renderArtifacts(snapshot) {
   const pane = $("#tab-artifacts");
   const items = (snapshot && snapshot.artifacts) || [];
   if (!items.length) { pane.innerHTML = '<p class="muted">No artefacts yet.</p>'; return; }
-  pane.innerHTML = `<ul class="artifact-list">${items.map((a) => `
+  pane.innerHTML = `<div class="artifact-actions">
+      <a class="btn btn-primary btn-sm" href="/api/sessions/${encodeURIComponent(S.sessionId)}/export" download>Download all (.zip)</a>
+    </div>
+    ${runFacts(snapshot.run_facts || {})}
+    <ul class="artifact-list">${items.map((a) => `
     <li><a href="/api/artifacts/${encodeURIComponent(S.sessionId)}/${encodeURIComponent(a.name)}" download>
       <span>${escapeHtml(a.name)}</span><span class="muted small">${bytes(a.bytes)}</span></a></li>`).join("")}</ul>
     <p class="muted small">Files are also on disk under <code>outputs/${escapeHtml(S.sessionId)}/</code>.</p>`;
+}
+
+function runFacts(facts) {
+  // Every value here comes from a JSON file we wrote ourselves, and is still escaped before it reaches
+  // the DOM: a hand-edited metadata.json is a possible injection path.
+  if (!facts || !Object.keys(facts).length) return "";
+  const rows = [];
+  if (facts.pdf_engine) {
+    rows.push(`PDF engine: <b>${escapeHtml(facts.pdf_engine)}</b>${facts.pdf_available ? "" : " (not produced)"}`);
+  }
+  const rungs = (facts.structured_output || {}).rung_counts || {};
+  if (Object.keys(rungs).length) {
+    rows.push("Structured output: " + Object.entries(rungs).map(([rung, count]) => `${escapeHtml(rung)} × ${count}`).join(", "));
+  }
+  const usage = facts.llm_usage || {};
+  if (usage.calls) {
+    rows.push(`Model calls: <b>${usage.calls}</b>${usage.failures ? ` (${usage.failures} failed, retried)` : ""}`);
+  }
+  const phases = facts.phase_metrics || {};
+  const slowest = Object.entries(phases)
+    .filter(([, v]) => Number(v.wall_seconds) > 0)
+    .sort((a, b) => Number(b[1].wall_seconds) - Number(a[1].wall_seconds))
+    .slice(0, 3);
+  if (slowest.length) {
+    rows.push(
+      "Slowest phases: " +
+        slowest.map(([phase, v]) => `${escapeHtml(phase)} ${Math.round(v.wall_seconds)}s (${v.calls} calls)`).join(", ")
+    );
+  }
+  if (facts.pages) rows.push(`PDF pages: ${facts.pages}`);
+  if (facts.qa_ok !== undefined) rows.push(facts.qa_ok ? "QA gates: passed" : "QA gates: warnings");
+
+  const warnings = (facts.qa_warnings || []).map((w) => `<li class="muted small">${escapeHtml(w)}</li>`);
+  return `<div class="run-facts"><p class="muted small">${rows.join(" · ")}</p>${warnings.length ? `<ul>${warnings.join("")}</ul>` : ""}</div>`;
 }
 
 let mermaidSeq = 0;
@@ -321,13 +476,27 @@ async function renderDiagrams(diagrams, statusText = "") {
   source.hidden = false;
 }
 
-/* --------------------------------------------------------------- event stream */
+/* ---------------------------------------------------------------- event stream */
+
+// EventSource only delivers a frame to a listener registered for that exact `event:` name. A type
+// missing from this list is dropped in silence: the run keeps emitting, the page shows nothing.
+const STREAM_EVENT_TYPES = [
+  "session", "step_start", "step_end", "token", "reasoning", "status", "question", "answer",
+  "ledger", "spec", "diagram", "review", "tool_call", "artifact", "approval", "warning", "error", "log",
+];
 
 function connectStream(sessionId) {
   disconnectStream();
-  const url = `/api/sessions/${sessionId}/stream?after=${S.lastEventId}`;
+  // EventSource cannot set headers, so the token travels as a query parameter when auth is enabled.
+  const token = authToken();
+  const url = `/api/sessions/${sessionId}/stream?after=${S.lastEventId}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
   const es = new EventSource(url);
   S.es = es;
+  for (const type of STREAM_EVENT_TYPES) {
+    es.addEventListener(type, (frame) => {
+      handleEvent(JSON.parse(frame.data)).catch((error) => toast(`could not render ${type}: ${error.message}`, true));
+    });
+  }
   es.onopen = () => { $("#health-dot").className = "dot dot-on"; };
   es.onerror = () => {
     // Browser reconnects automatically and sends Last-Event-ID; we only surface the state.
@@ -351,6 +520,9 @@ async function handleEvent(event) {
   const type = event.type;
   traceLine(event);
   if (type !== "token" && type !== "reasoning") scheduleRefresh();
+  if (type === "step_end" || type === "question" || type === "approval" || type === "error") {
+    scheduleSessionListRefresh();
+  }
 
   switch (type) {
     case "token":
@@ -363,6 +535,7 @@ async function handleEvent(event) {
 
     case "step_start":
       closeStreams();
+      startActivityIndicator(payload.phase);
       if (S.snapshot) { S.snapshot.phase = payload.phase; renderStepper(S.snapshot); }
       break;
 
@@ -372,6 +545,7 @@ async function handleEvent(event) {
 
     case "question": {
       closeStreams();
+      stopActivityIndicator();
       const { el, body } = card({ role: "interview", kind: "question", time: event.ts,
         tags: [{ text: payload.subject }, { text: `${payload.purpose || "agenda"}` }] });
       body.innerHTML = `<p><b>${escapeHtml(payload.question)}</b></p>` +
@@ -380,6 +554,7 @@ async function handleEvent(event) {
             <div class="muted small">${payload.progress.covered}/${payload.progress.subjects} subjects covered</div>` : "");
       pushCard(el);
       if (S.snapshot) {
+        S.snapshot.awaiting = "answer";
         S.snapshot.pending_question = { id: payload.id, subject: payload.subject, text: payload.question,
           rationale: payload.rationale, options: payload.options || [], purpose: payload.purpose };
         renderQuestionCard(S.snapshot);
@@ -389,10 +564,16 @@ async function handleEvent(event) {
 
     case "answer": {
       if (payload.channel === "chat") break;   // chat replies are rendered from the response
-      const { el, body } = card({ role: "user", kind: "user", time: event.ts, tags: [{ text: payload.subject || "" }] });
+      const answerTags = [{ text: payload.subject || "" }];
+      if (payload.source === "simulated") answerTags.push({ text: "simulated stakeholder", cls: "warn" });
+      const { el, body } = card({ role: "user", kind: "user", time: event.ts, tags: answerTags });
       body.innerHTML = `<p>${escapeHtml(payload.answer || "")}</p>`;
       pushCard(el);
-      if (S.snapshot) { S.snapshot.pending_question = null; renderQuestionCard(S.snapshot); }
+      if (S.snapshot) {
+        S.snapshot.awaiting = "none";
+        S.snapshot.pending_question = null;
+        renderQuestionCard(S.snapshot);
+      }
       break;
     }
 
@@ -451,15 +632,20 @@ async function handleEvent(event) {
 
     case "approval": {
       if (payload.requested) {
+        stopActivityIndicator();
+        if (S.snapshot) {
+          S.snapshot.awaiting = "approval";
+          S.snapshot.pending_question = null;
+          renderQuestionCard(S.snapshot);
+        }
         const { el, body } = card({ role: "summary", kind: "question", time: event.ts, tags: [{ text: "approval needed" }] });
-        body.innerHTML = `<p>The requirements summary is ready for your review — see the <b>Spec</b> panel.</p>
-          <div style="display:flex;gap:8px;margin-top:8px">
-            <button class="btn btn-primary btn-sm" data-approve="yes">Approve &amp; draft the FSD</button>
-            <button class="btn btn-ghost btn-sm" data-approve="no">Request changes…</button></div>`;
+        body.innerHTML = '<p>The requirements summary is ready. Review it in the Spec panel and use the approval controls below.</p>';
         pushCard(el);
-        el.querySelector('[data-approve="yes"]').addEventListener("click", () => approve(true, ""));
-        el.querySelector('[data-approve="no"]').addEventListener("click", () => $("#dlg-reject").showModal());
       } else {
+        if (S.snapshot) {
+          S.snapshot.awaiting = "none";
+          renderQuestionCard(S.snapshot);
+        }
         const { el, body } = card({ role: "user", kind: "user", time: event.ts, tags: [{ text: payload.approved ? "approved" : "changes requested" }] });
         body.innerHTML = `<p>${payload.approved ? "Summary approved." : escapeHtml(payload.notes || "Changes requested.")}</p>`;
         pushCard(el);
@@ -495,6 +681,7 @@ async function handleEvent(event) {
     }
 
     case "error": {
+      stopActivityIndicator();
       closeStreams();
       const { el, body } = card({ role: payload.role || "engine", kind: "error", time: event.ts, tags: [{ text: "error", cls: "err" }] });
       body.innerHTML = `<p>${escapeHtml(payload.message || "unknown error")}</p>`;
@@ -516,6 +703,17 @@ async function handleEvent(event) {
         body.innerHTML = `<p>Deliverables written.</p><ul>
             <li>${stats.words || 0} words · ${stats.functional || 0} functional / ${stats.non_functional || 0} non-functional requirements</li>
             <li>${(payload.artifacts || []).map((a) => escapeHtml(a.name)).join(", ")}</li></ul>`;
+        pushCard(el);
+      } else if (payload.event === "transcript_mode") {
+        // Safe: subject names are escapeHtml'd, counts are server-side integers.
+        const { el, body } = card({ role: "engine", kind: "question", time: event.ts, tags: [{ text: "transcript", cls: "ok" }] });
+        const covered = (payload.covered || []).map((name) => `<li>${escapeHtml(name)} <span class="tag">covered</span></li>`);
+        const uncovered = (payload.uncovered || []).map((name) => `<li>${escapeHtml(name)} <span class="tag">needs questions</span></li>`);
+        body.innerHTML =
+          `<p>${escapeHtml(payload.message || "")}</p>` +
+          `<ul>${covered.join("")}${uncovered.join("")}</ul>` +
+          `<p class="muted small">${payload.excerpts_triaged || 0} excerpt(s) triaged, ` +
+          `${payload.ledger_entries || 0} ledger entries seeded</p>`;
         pushCard(el);
       } else if (payload.event === "chat_reply") {
         const { el, body } = card({ role: "chat", time: event.ts, tags: [{ text: `${payload.iterations || 1} step(s)` }] });
@@ -543,8 +741,16 @@ function renderMetaFromStats(stats) {
 
 /* ------------------------------------------------------------------ sessions */
 
+const SESSION_PAGE = 20;
+const EVENT_PAGE_SIZE = 500;
+
 async function loadSessions() {
-  const rows = await api("/api/sessions");
+  const response = await fetch("/api/sessions?limit=" + SESSION_PAGE + "&offset=" + S.sessionOffset);
+  if (!response.ok) throw new Error("session list failed: " + response.status);
+  const rows = await response.json();
+  const total = parseInt(response.headers.get("X-Total-Count") || String(rows.length), 10);
+  S.sessionTotal = total;
+
   const list = $("#session-list");
   list.innerHTML = "";
   if (!rows.length) { list.innerHTML = '<li class="empty">none yet</li>'; return; }
@@ -552,11 +758,54 @@ async function loadSessions() {
     const li = document.createElement("li");
     li.className = "session-item" + (row.id === S.sessionId ? " active" : "");
     const pillClass = row.status === "error" ? "error" : (row.phase === "done" ? "done" : "");
-    li.innerHTML = `<span class="t">${escapeHtml(row.title || row.id)}</span>
-      <span class="m"><span class="phase-pill ${pillClass}">${escapeHtml(row.phase)}</span>${escapeHtml((row.updated_at || "").slice(0, 16).replace("T", " "))}</span>`;
-    li.addEventListener("click", () => openSession(row.id));
+    li.innerHTML = `<span class="t">${escapeHtml(row.title || row.id)}${row.busy ? ' <span class="busy-dot" title="run in progress">●</span>' : ""}</span>
+      <span class="m"><span class="phase-pill ${pillClass}">${escapeHtml(row.phase)}</span>${escapeHtml((row.updated_at || "").slice(0, 16).replace("T", " "))}
+        <button class="icon-btn" data-action="rename" title="Rename" aria-label="Rename session">&#9998;</button>
+        <button class="icon-btn danger" data-action="delete" title="Delete" aria-label="Delete session">&#10005;</button>
+      </span>`;
+    li.querySelector(".t").addEventListener("click", () => openSession(row.id));
+    li.querySelector('[data-action="rename"]').addEventListener("click", (event) => {
+      event.stopPropagation(); renameSession(row.id, row.title);
+    });
+    li.querySelector('[data-action="delete"]').addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (!confirm(`Delete "${row.title || row.id}" and its outputs?`)) return;
+      try {
+        await api(`/api/sessions/${row.id}`, { method: "DELETE" });
+        if (S.sessionId === row.id) S.sessionId = null;
+        toast("Session deleted");
+        await loadSessions();
+      } catch (error) { toast(error.message, true); }
+    });
     list.appendChild(li);
   });
+
+  const pager = $("#session-pager");
+  if (pager) {
+    pager.innerHTML = "";
+    if (total > SESSION_PAGE) {
+      pager.hidden = false;
+      pager.textContent = `${rows.length} of ${total} sessions · `;
+      const older = document.createElement("button");
+      older.className = "btn btn-ghost btn-sm";
+      older.textContent = "Load older";
+      older.addEventListener("click", async () => {
+        S.sessionOffset += SESSION_PAGE;
+        try { await loadSessions(); } catch (error) { toast(error.message, true); }
+      });
+      pager.appendChild(older);
+    } else { pager.hidden = true; }
+  }
+}
+
+async function renameSession(sessionId, currentTitle) {
+  const title = prompt("Session title", currentTitle || "");
+  if (!title || title === currentTitle) return;
+  try {
+    await api(`/api/sessions/${sessionId}`, { method: "PATCH", body: { title } });
+    toast("Renamed");
+    await loadSessions();
+  } catch (error) { toast(error.message, true); }
 }
 
 async function openSession(sessionId) {
@@ -570,8 +819,15 @@ async function openSession(sessionId) {
   $("#tab-trace").innerHTML = "";
 
   await refreshSnapshot();
-  const events = await api(`/api/sessions/${sessionId}/events?after=0&limit=1500`);
-  for (const event of events) await handleEvent(event);
+  let cursor = 0;
+  while (true) {
+    const events = await api(`/api/sessions/${sessionId}/events?after=${cursor}&limit=${EVENT_PAGE_SIZE}`);
+    for (const event of events) {
+      await handleEvent(event);
+      cursor = Math.max(cursor, Number(event.id) || 0);
+    }
+    if (events.length < EVENT_PAGE_SIZE) break;
+  }
   if (!$("#timeline").children.length) {
     $("#timeline").innerHTML = '<p class="muted">No activity recorded yet.</p>';
   }
@@ -625,6 +881,12 @@ async function approve(approved, notes) {
 }
 
 async function sendChat(message) {
+  // Chat runs in the background; disable the composer so a second message cannot race the first.
+  const input = $("#chat-input");
+  const button = $("#chat-form button[type=submit]");
+  input.disabled = true;
+  button.disabled = true;
+  button.textContent = "Working…";
   const { el, body } = card({ role: "user", kind: "user", tags: [{ text: "you" }] });
   body.innerHTML = `<p>${escapeHtml(message)}</p>`;
   pushCard(el);
@@ -636,6 +898,10 @@ async function sendChat(message) {
     pending.el.remove();          // the persisted chat_reply event renders the answer
   } catch (error) {
     pending.body.innerHTML = `<p style="color:var(--error)">${escapeHtml(error.message)}</p>`;
+  } finally {
+    input.disabled = false;
+    button.disabled = false;
+    button.textContent = "Ask";
   }
 }
 
@@ -656,13 +922,19 @@ async function loadModels() {
   S.embeddingModel = data.embedding_model;
   S.provider = data.provider || "LM Studio";
 
-  const healthy = (data.chat_models || []).length > 0;
+  const models = data.chat_models || [];
+  const healthy = models.length > 0;
   $("#health-dot").className = "dot " + (healthy ? "dot-on" : "dot-off");
-  const loaded = (data.chat_models || []).filter((m) => m.state === "loaded").map((m) => m.id);
-  $("#health-text").textContent = healthy
-    ? `${data.provider || "LM Studio"} · ${data.chat_models.length} model(s), ${loaded.length} loaded`
-    : (data.provider || "LM Studio") + ": no models found";
+  // Only providers with an admin API report load state; Strata does not, so "0 loaded" there would
+  // be a lie — the server only lists models it can actually serve.
+  const reportsState = models.some((m) => m.state === "loaded" || m.state === "not loaded");
+  const loaded = models.filter((m) => m.state === "loaded").length;
+  const providerName = data.provider || "LM Studio";
+  $("#health-text").textContent = !healthy
+    ? `${providerName}: no models found`
+    : `${providerName} · ${models.length} model(s)${reportsState ? `, ${loaded} loaded` : ""}`;
 
+  renderProviderSelect(data);
   fillModelSelect($("#model-select"), S.defaultModel, true);
   fillModelSelect($("#new-model"), S.defaultModel, true);
   fillEmbeddingSelect(data.embedding_models || []);
@@ -678,13 +950,13 @@ function modelLabel(model) {
   return `${model.id}${bits.length ? " — " + bits.join(", ") : ""}`;
 }
 
-function fillModelSelect(select, selected, includeDefault) {
+function fillModelSelect(select, selected, includeDefault, defaultLabel = "(default / first loaded model)") {
   if (!select) return;
   select.innerHTML = "";
   if (includeDefault) {
     const option = document.createElement("option");
     option.value = "";
-    option.textContent = "(default / first loaded model)";
+    option.textContent = defaultLabel;
     select.appendChild(option);
   }
   S.models.forEach((model) => {
@@ -696,6 +968,31 @@ function fillModelSelect(select, selected, includeDefault) {
   if (selected) select.value = selected;
 }
 
+function renderProviderSelect(models) {
+  const select = $("#provider-select");
+  if (!select) return;
+  const names = { lmstudio: "LM Studio", strata: "Strata" };
+  select.innerHTML = (models.providers || ["lmstudio", "strata"])
+    .map((p) => `<option value="${escapeHtml(p)}"${p === models.provider ? " selected" : ""}>${escapeHtml(names[p] || p)}</option>`)
+    .join("");
+  const base = $("#provider-base");
+  if (base) base.textContent = models.base_url ? `${models.provider} → ${models.base_url}` : "";
+}
+
+async function saveProvider() {
+  const select = $("#provider-select");
+  if (!select) return;
+  try {
+    const saved = await api("/api/models", { method: "POST", body: { provider: select.value } });
+    S.provider = saved.provider;
+    toast(`Backend switched to ${saved.provider}`);
+    await loadModels();
+    await loadHealth();
+  } catch (error) {
+    toast(`Provider switch failed: ${error.message}`, true);
+  }
+}
+
 function fillEmbeddingSelect(embeddings) {
   const select = $("#embedding-select");
   if (!select) return;
@@ -703,16 +1000,104 @@ function fillEmbeddingSelect(embeddings) {
     embeddings.map((m) => `<option value="${escapeHtml(m.id)}"${m.id === S.embeddingModel ? " selected" : ""}>${escapeHtml(m.id)}</option>`).join("");
 }
 
+const SETTING_LABELS = {
+  max_questions_per_subject: "Questions per subject",
+  min_subjects: "Minimum subjects",
+  max_subjects: "Maximum subjects",
+  max_gap_rounds: "Gap rounds",
+  max_gap_questions_per_round: "Gap questions per round",
+  max_summary_rejections: "Summary rejections allowed",
+  max_total_questions: "Total questions ceiling",
+  max_transcript_chunks: "Transcript chunks",
+  transcript_chunk_chars: "Transcript chunk size",
+  max_review_rounds: "Review rounds",
+  min_functional_requirements: "Minimum requirements",
+  require_acceptance_criteria: "Require acceptance criteria",
+  max_revision_rounds: "Diagram revision rounds",
+  max_diagrams: "Maximum diagrams",
+  local_renderer: "Local Mermaid renderer",
+  docs_dir: "Knowledge documents directory",
+  chunk_size: "Knowledge chunk size",
+  chunk_overlap: "Chunk overlap",
+  heading_aware: "Heading-aware chunking",
+  top_k: "Retrieval top-k",
+  min_score: "Minimum score",
+  subject_coverage_threshold: "Transcript coverage needed to skip a question",
+  render_timeout_seconds: "Mermaid render timeout (s)",
+  emit_png: "Also save a PNG of each diagram",
+};
+
+async function loadSettings() {
+  try {
+    const data = await api("/api/settings");
+    S.settings = data.settings;
+    renderSettingsGrid(data.settings);
+
+    renderProviderSelect(data.models || {});
+
+    // Model lanes live in the same dialog: budgets and model choice are both "how this run behaves".
+    const lanes = $("#settings-models");
+    if (lanes) {
+      const overrides = data.models?.overrides || {};
+      lanes.innerHTML = (data.models?.roles || []).map((role) => `
+        <label>${escapeHtml(ROLE_LABELS[role] || role)}
+          <select id="settings-role-${role}" data-role="${role}">
+            <option value="">${escapeHtml(role === "human" ? "Real human" : (data.models?.default_model || "provider default"))}</option>
+            ${(S.models || []).map((m) => `<option value="${escapeHtml(m.id)}" ${overrides[role] === m.id ? "selected" : ""}>${escapeHtml(modelLabel(m))}</option>`).join("")}
+          </select></label>`).join("");
+    }
+
+    // What previous runs taught the engine — the feedback loop should be visible, not hidden in a table.
+    // Values come from our own SQLite store and every field is HTML-escaped before insertion.
+    const lessonsBox = $("#settings-lessons");
+    if (lessonsBox) {
+      const lessons = await api("/api/lessons?limit=12");
+      lessonsBox.innerHTML = lessons.lessons.length
+        ? lessons.lessons
+            .map(
+              (l) =>
+                `<li><span class="lesson-kind">${escapeHtml(l.kind)}</span> ${escapeHtml(l.text)}` +
+                (l.seen_count > 1 ? ` <span class="lesson-seen">seen ${l.seen_count}×</span>` : "") +
+                `</li>`
+            )
+            .join("")
+        : "<li>No lessons recorded yet — they appear after a run completes.</li>";
+    }
+  } catch (error) { toast(error.message, true); }
+}
+
+// Budget fields only. The store keeps a delta over config.yaml containing just the keys the user changed,
+// so this grid always reflects the effective values rather than a frozen snapshot.
+function renderSettingsGrid(settings) {
+  const grid = $("#settings-grid");
+  if (!grid) return;
+  grid.innerHTML = Object.entries(settings).map(([section, values]) => `
+      <div class="settings-section">
+        <h3>${escapeHtml(section)}</h3>
+        ${Object.entries(values).map(([key, value]) => `
+          <label>${escapeHtml(SETTING_LABELS[key] || key)}
+            ${typeof value === "boolean"
+              ? `<select data-section="${section}" data-key="${key}">
+                   <option value="true" ${value ? "selected" : ""}>yes</option>
+                   <option value="false" ${value ? "" : "selected"}>no</option>
+                 </select>`
+              : typeof value === "number"
+                ? `<input type="number" data-section="${section}" data-key="${key}" value="${value}">`
+                : `<input type="text" data-section="${section}" data-key="${key}" value="${escapeHtml(String(value))}">`}
+          </label>`).join("")}
+      </div>`).join("");
+}
+
 function buildRoleGrid() {
   const grid = $("#role-grid");
   if (!grid) return;
-  const roles = ["plan", "interview", "triage", "summary", "writer", "use_cases", "glossary", "critic", "diagrammer", "mermaid_reviewer"];
+  const roles = ["plan", "interview", "triage", "summary", "writer", "use_cases", "glossary", "critic", "diagrammer", "mermaid_reviewer", "human"];
   grid.innerHTML = roles.map((role) => `
     <label>${escapeHtml(ROLE_LABELS[role] || role)}
       <select data-role="${role}"></select></label>`).join("");
   grid.querySelectorAll("select").forEach((select) => {
     const role = select.dataset.role;
-    fillModelSelect(select, S.overrides[role] || "", true);
+    fillModelSelect(select, S.overrides[role] || "", true, role === "human" ? "Real human" : undefined);
   });
 }
 
@@ -728,11 +1113,19 @@ async function saveModels() {
 async function saveRoleOverrides() {
   const overrides = {};
   $$("#role-grid select").forEach((select) => { if (select.value) overrides[select.dataset.role] = select.value; });
-  const embedding = $("#embedding-select").value || null;
+  // The select is sent too: choosing "" is a deliberate "no embeddings, BM25 only" — a value the server
+  // cannot infer from an absent field.
+  const embeddingSelect = $("#embedding-select");
+  const embedding = embeddingSelect ? embeddingSelect.value : null;
   try {
-    await api("/api/models", { method: "POST", body: { overrides } });
+    const saved = await api("/api/models", {
+      method: "POST",
+      body: { overrides, ...(embeddingSelect ? { embedding_model: embedding } : {}) },
+    });
     S.overrides = overrides;
+    S.embeddingModel = saved.embedding_model || null;
     toast("Per-role models saved");
+    loadHealth();
   } catch (error) { toast(error.message, true); }
 }
 
@@ -742,8 +1135,17 @@ async function loadHealth() {
   try {
     const data = await api("/api/health");
     const kb = data.knowledge || {};
-    $("#kb-status").innerHTML = `${kb.chunks || 0} chunks from ${kb.documents || 0} document(s)<br>` +
-      `vector search: <b>${kb.vector_search ? "on" : "off (BM25 only)"}</b>`;
+    // Be explicit about which retrieval is actually running: without an embedding model the search is
+    // lexical (BM25), not semantic, and the provider determines whether embeddings are even available.
+    const retrieval = kb.vector_search
+      ? `BM25 + vector (<b>${escapeHtml(kb.embedding_model || "unknown")}</b>)`
+      : `<b>BM25 keyword only</b> — ${escapeHtml(kb.vector_search_reason || "no embedding model")}`;
+    const pdf = data.pdf || {};
+    const engine = pdf.engine
+      ? `${escapeHtml(pdf.engine)}${pdf.engine === "typst" ? "" : " (Typst binary not found)"}`
+      : "none";
+    $("#kb-status").innerHTML =
+      `${kb.chunks || 0} chunks from ${kb.document_count || 0} document(s)<br>retrieval: ${retrieval}<br>PDF: ${engine}`;
   } catch (error) {
     $("#kb-status").textContent = "knowledge base unavailable";
   }
@@ -764,7 +1166,8 @@ function wire() {
     if (event.submitter && event.submitter.value !== "create") return;
     event.preventDefault();
     const brief = $("#new-brief").value.trim();
-    if (!brief) { toast("A project brief is required.", true); return; }
+    const transcript = $("#new-transcript").value.trim();
+    if (!brief && !transcript) { toast("Give a project brief, or paste a transcript to start from.", true); return; }
     const urls = $("#new-urls").value.split("\n").map((u) => u.trim()).filter(Boolean);
     const button = $("#new-create");
     button.disabled = true;
@@ -773,12 +1176,45 @@ function wire() {
       if ($("#new-model").value) overrides.default = $("#new-model").value;
       const data = await api("/api/sessions", {
         method: "POST",
-        body: { brief, title: $("#new-title").value.trim(), urls, model_overrides: overrides },
+        body: {
+          brief,
+          title: $("#new-title").value.trim(),
+          urls,
+          model_overrides: overrides,
+          transcript,
+          transcript_source: transcript ? (S.transcriptSource || "pasted transcript") : "",
+        },
       });
       $("#dlg-new").close();
       $("#new-brief").value = ""; $("#new-urls").value = ""; $("#new-title").value = "";
+      $("#new-transcript").value = "";
+      S.transcriptSource = "";
+      updateTranscriptCount();
       await openSession(data.session.id);
     } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+  });
+
+  const updateTranscriptCount = () => {
+    const count = $("#transcript-count");
+    if (!count) return;
+    const length = $("#new-transcript").value.length;
+    count.textContent = length ? `${length.toLocaleString()} characters loaded` : "";
+  };
+  $("#new-transcript").addEventListener("input", updateTranscriptCount);
+  $("#new-transcript-file-btn").addEventListener("click", () => $("#new-transcript-file").click());
+  $("#new-transcript-file").addEventListener("change", (event) => {
+    const file = event.target.files && event.target.files[0];
+    if (!file) return;
+    if (file.size > 200000) {
+      toast("That transcript is larger than 200 KB — paste the relevant part instead.", true);
+      return;
+    }
+    file.text().then((text) => {
+      $("#new-transcript").value = text;
+      S.transcriptSource = file.name;
+      updateTranscriptCount();
+      toast(`Loaded ${file.name} (${text.length.toLocaleString()} characters).`);
+    });
   });
 
   // answers
@@ -819,7 +1255,48 @@ function wire() {
 
   // models
   $("#model-select").addEventListener("change", saveModels);
+  $("#provider-select")?.addEventListener("change", saveProvider);
   $("#btn-advanced").addEventListener("click", () => { buildRoleGrid(); $("#dlg-advanced").showModal(); });
+  $("#btn-settings").addEventListener("click", () => { loadSettings(); $("#dlg-settings").showModal(); });
+  $("#settings-reset")?.addEventListener("click", async () => {
+    // The store keeps only the keys the user changed; resetting clears that delta so config.yaml wins again.
+    try {
+      const data = await api("/api/settings/reset", { method: "POST" });
+      S.settings = data.settings;
+      renderSettingsGrid(data.settings);
+      toast("Settings reset to the values this server started with");
+    } catch (error) {
+      toast(`Reset failed: ${error.message}`);
+    }
+  });
+
+  $("#settings-form").addEventListener("submit", async (event) => {
+    if (event.submitter && event.submitter.value !== "save") return;
+    event.preventDefault();
+    const patch = {};
+    $$("#settings-grid [data-section][data-key]").forEach((field) => {
+      const section = field.dataset.section;
+      const key = field.dataset.key;
+      const raw = field.value.trim();
+      if (raw === "") return;
+      const current = S.settings[section][key];
+      patch[section] = Object.assign(patch[section] || {}, {
+        [key]: typeof current === "number" ? Number(raw) : typeof current === "boolean" ? raw === "true" : raw,
+      });
+    });
+    const laneSelects = $$("#settings-models select");
+    const lanes = Object.fromEntries(laneSelects.map((select) => [select.dataset.role, select.value]));
+    if (!Object.keys(patch).length && !laneSelects.length) { toast("Nothing to apply."); return; }
+    try {
+      if (Object.keys(patch).length) await api("/api/settings", { method: "PATCH", body: patch });
+      if (laneSelects.length) {
+        await api("/api/models", { method: "POST", body: { overrides: lanes } });
+        S.overrides = Object.fromEntries(Object.entries(lanes).filter(([, model]) => model));
+      }
+      toast("Settings updated.");
+      $("#dlg-settings").close();
+    } catch (error) { toast(error.message, true); }
+  });
   $("#adv-form").addEventListener("submit", async (event) => {
     if (event.submitter && event.submitter.value !== "save") return;
     event.preventDefault();
@@ -861,6 +1338,30 @@ function wire() {
   });
 
   $("#btn-diagram-refresh").addEventListener("click", () => renderDiagrams(S.diagrams, "re-rendered"));
+
+  const ledgerDialog = $("#dlg-ledger");
+  if (ledgerDialog) {
+    ledgerDialog.addEventListener("submit", async (event) => {
+      if (event.submitter && event.submitter.value !== "save") return;
+      event.preventDefault();
+      const itemId = ledgerDialog.dataset.itemId;
+      if (!itemId) return;
+      try {
+        await api(`/api/sessions/${S.sessionId}/ledger/${encodeURIComponent(itemId)}`, {
+          method: "POST",
+          body: {
+            title: $("#ledger-title").value,
+            body: $("#ledger-body").value,
+            priority: $("#ledger-priority").value,
+            acceptance: $("#ledger-acceptance").value.split("\n").map((s) => s.trim()).filter(Boolean),
+          },
+        });
+        ledgerDialog.close();
+        toast("Ledger updated — the spec will be rebuilt from it");
+        await refreshSnapshot();
+      } catch (error) { toast(error.message, true); }
+    });
+  }
 
   window.addEventListener("beforeunload", disconnectStream);
 }

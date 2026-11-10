@@ -59,6 +59,7 @@ body {
 .session-item:hover { background: var(--bg-hover) }
 .session-item.active { background: var(--bg-card); border-color: var(--border) }
 .session-item .t { font-weight: 550; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.session-item .busy-dot { color: var(--accent); font-size: 10px }
 .session-item .m { font-size: 11px; color: var(--muted); display: flex; gap: 6px; align-items: center }
 
 .phase-pill { font-size: 10px; padding: 1px 6px; border-radius: 20px; background: #1e2a38; color: var(--fg-dim) }
@@ -117,12 +118,12 @@ textarea { resize: vertical; min-height: 42px }
 .step + .step::before { content: "›"; margin-right: 6px; color: #2f3d51 }
 
 /* timeline */
-.timeline { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px }
+.timeline { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 18px; display: flex; flex-direction: column; gap: 12px }
 .welcome { max-width: 720px; margin: auto; color: var(--fg-dim) }
 .welcome h2 { color: var(--fg); margin-top: 0 }
 .welcome ul { padding-left: 18px }
 
-.card { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden }
+.card { flex-shrink: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden }
 .card > header {
   display: flex; align-items: center; gap: 8px; padding: 7px 12px; font-size: 11.5px; color: var(--fg-dim);
   background: #131b26; border-bottom: 1px solid var(--border);
@@ -156,13 +157,19 @@ details.tool pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0 
 
 /* composer */
 .composer { border-top: 1px solid var(--border); background: var(--bg-soft); padding: 12px 16px; display: flex; flex-direction: column; gap: 10px }
+.activity-indicator { display: flex; align-items: center; gap: 8px; color: var(--fg-dim); font-size: 12px; min-height: 20px }
+.activity-indicator::before { content: ""; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: activity-spin .8s linear infinite }
+@keyframes activity-spin { to { transform: rotate(360deg) } }
+@media (prefers-reduced-motion: reduce) { .activity-indicator::before { animation-duration: 2s } }
+.approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px }
 .question-card { background: rgba(61,220,151,.07); border: 1px solid rgba(61,220,151,.3); border-radius: var(--radius); padding: 10px 12px }
 .question-card .q-subject { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent) }
 .question-card .q-text { font-size: 15px; margin: 4px 0 2px }
 .question-card .q-why { font-size: 12px; color: var(--muted) }
 .q-options { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px }
-.chip { border: 1px solid var(--border); background: #101823; border-radius: 20px; padding: 4px 10px; font-size: 12px; cursor: pointer }
-.chip:hover { border-color: var(--accent-dark) }
+.chip { border: 1px solid var(--border); background: #101823; color: var(--fg); border-radius: 20px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer }
+.chip:hover { border-color: var(--accent-dark); background: var(--bg-hover) }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }
 
 .answer-form { display: flex; gap: 8px; align-items: flex-end }
 .answer-form textarea { flex: 1; max-width: none }
@@ -194,6 +201,10 @@ table.data th { color: var(--muted); font-weight: 600; position: sticky; top: 0;
 .artifact-list a { color: var(--info); text-decoration: none; display: flex; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px }
 .artifact-list a:hover { background: var(--bg-hover) }
 
+.run-facts { margin: 0 0 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-hover) }
+.run-facts ul { list-style: none; margin: 6px 0 0; padding: 0 }
+.run-facts li { color: var(--warn); font-size: 12px }
+
 .trace-line { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 2px 0; border-bottom: 1px dashed #1b2430; word-break: break-word }
 .trace-line b { color: var(--fg) }
 
@@ -222,6 +233,18 @@ dialog textarea, dialog input, dialog select { max-width: none }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px }
 .role-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; margin-bottom: 12px }
 
+.settings-grid { display: grid; gap: 14px; margin-bottom: 12px }
+.settings-models { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px }
+.lessons-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px }
+.lessons-list li { font-size: 13px; line-height: 1.45; color: var(--muted-foreground) }
+.lesson-kind { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; margin-right: 6px }
+.lesson-seen { font-size: 11px; color: var(--muted); font-style: italic }
+.transcript-tools { display: flex; align-items: center; gap: 10px; margin-top: 8px }
+.settings-section { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px }
+.settings-section h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em }
+.settings-section label { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 6px }
+.settings-section input, .settings-section select { width: 110px }
+
 .toast {
   position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); background: #1b2430; color: var(--fg);
   border: 1px solid var(--border); padding: 10px 16px; border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.5); z-index: 50;
@@ -236,3 +259,11 @@ dialog textarea, dialog input, dialog select { max-width: none }
   .panel { position: fixed; right: 0; top: 0; bottom: 0; width: min(560px, 92vw); z-index: 30; box-shadow: -18px 0 50px rgba(0,0,0,.5); transform: translateX(100%); transition: .2s }
   .panel.open { transform: none }
 }
+
+.session-pager { margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+.icon-btn { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; }
+.icon-btn:hover { background: var(--band, #eef2f6); color: var(--fg); }
+.icon-btn.danger:hover { background: #fdecec; color: var(--error, #b00020); }
+.ledger-edit { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 8px 0; }
+.ledger-edit input, .ledger-edit textarea { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; }
+.busy-note { font-size: 12px; color: var(--muted); margin: 6px 0; }
