@@ -16,9 +16,10 @@ import logging
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
 from .events import EventType
 from .schemas import ArtifactRef, LedgerItem, QAPair, SessionState
@@ -26,11 +27,67 @@ from .schemas import ArtifactRef, LedgerItem, QAPair, SessionState
 log = logging.getLogger(__name__)
 
 #: Version of the layout described by :data:`SCHEMA`. Bump it and add an entry to :data:`MIGRATIONS` for any change.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    """v1 -> v2: the lessons table (Phase 3 cross-session feedback loop)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lessons (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            kind        TEXT NOT NULL DEFAULT 'gap',
+            text        TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_lessons_created ON lessons(created_at DESC);
+        """
+    )
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether ``table`` already has ``column``.
+
+    A database created by the *current* build is built from :data:`SCHEMA`, which already carries these
+    columns, and a fresh database is stamped as v1 before the migrations run. So every migration must be
+    written to tolerate a table that is already up to date.
+    """
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: lesson frequency.
+
+    A lesson seen in ten runs is worth more than one seen once, and the plan prompt should rank by that.
+    Repeats are collapsed into a single row carrying a counter, so the store cannot grow without bound and
+    "how often has this happened" becomes answerable.
+    """
+    if not _has_column(conn, "lessons", "seen_count"):
+        conn.execute("ALTER TABLE lessons ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1")
+    if not _has_column(conn, "lessons", "updated_at"):
+        conn.execute("ALTER TABLE lessons ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+
+    conn.executescript(
+        """
+        UPDATE lessons SET updated_at = created_at WHERE updated_at = '';
+        UPDATE lessons
+        SET seen_count = (SELECT COUNT(*) FROM lessons l WHERE l.kind = lessons.kind AND l.text = lessons.text)
+        WHERE id = (SELECT MAX(id) FROM lessons l2 WHERE l2.kind = lessons.kind AND l2.text = lessons.text);
+        DELETE FROM lessons
+        WHERE id NOT IN (SELECT MAX(id) FROM lessons GROUP BY kind, text);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lessons_unique ON lessons(kind, text);
+        CREATE INDEX IF NOT EXISTS idx_lessons_rank ON lessons(seen_count DESC, updated_at DESC);
+        """
+    )
+
 
 #: ``version -> upgrade`` for databases created by an older build. Each callable upgrades the schema from
-#: ``version - 1`` to ``version`` and runs inside the migration transaction. Empty while v1 is the only layout.
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
+#: ``version - 1`` to ``version`` and runs inside the migration transaction.
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    2: _migrate_v2,
+    3: _migrate_v3,
+}
 
 #: Default cap on persisted events per session; older events are trimmed on every state save.
 DEFAULT_EVENT_RETENTION = 5000
@@ -73,6 +130,16 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);
 
+CREATE TABLE IF NOT EXISTS lessons (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL DEFAULT 'gap',
+    text        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    seen_count  INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL DEFAULT '',
+    UNIQUE (kind, text)
+);
 CREATE TABLE IF NOT EXISTS artifacts (
     name        TEXT NOT NULL,
     session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -115,7 +182,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 def new_session_id() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     return f"ba-{stamp}-{uuid.uuid4().hex[:6]}"
 
 
@@ -163,8 +230,10 @@ class Store:
             current = 1
         if current > SCHEMA_VERSION:
             self._conn.commit()
-            raise RuntimeError(f"{self.db_path} has schema version {current}, newer than this build "
-                               f"({SCHEMA_VERSION}); refusing to open it")
+            raise RuntimeError(
+                f"{self.db_path} has schema version {current}, newer than this build "
+                f"({SCHEMA_VERSION}); refusing to open it"
+            )
         for version in range(current + 1, SCHEMA_VERSION + 1):
             upgrade = MIGRATIONS.get(version)
             if upgrade is None:
@@ -176,19 +245,45 @@ class Store:
 
     # -- sessions -----------------------------------------------------------
 
-    def create_session(self, brief: str, title: str = "", model_overrides: dict[str, str] | None = None) -> SessionState:
+    def create_session(
+        self,
+        brief: str,
+        title: str = "",
+        model_overrides: dict[str, str] | None = None,
+        transcript: str = "",
+        transcript_source: str = "",
+    ) -> SessionState:
+        """Create a session.
+
+        `transcript` is an optional elicitation record (meeting notes / a prior interview) that the engine
+        triages into the ledger instead of re-asking the stakeholder. It rides in state_json, so Phase 3
+        transcript ingestion needs no schema migration.
+        """
+        transcript = (transcript or "").strip()
+        seed = brief.strip() or transcript
         state = SessionState(
             session_id=new_session_id(),
-            title=title or (brief.strip().splitlines()[0][:80] if brief.strip() else "Untitled interview"),
+            title=title or (seed.splitlines()[0][:80] if seed else "Untitled interview"),
             brief=brief.strip(),
             model_overrides=dict(model_overrides or {}),
+            transcript=transcript,
+            transcript_source=transcript_source or ("uploaded transcript" if transcript else ""),
         )
         with self._lock:
             self._conn.execute(
                 "INSERT INTO sessions (id,title,brief,phase,status,awaiting,created_at,updated_at,state_json)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",
-                (state.session_id, state.title, state.brief, state.phase.value, state.status.value,
-                 state.awaiting.value, state.created_at, state.updated_at, state.model_dump_json()),
+                (
+                    state.session_id,
+                    state.title,
+                    state.brief,
+                    state.phase.value,
+                    state.status.value,
+                    state.awaiting.value,
+                    state.created_at,
+                    state.updated_at,
+                    state.model_dump_json(),
+                ),
             )
             self._conn.commit()
         return state
@@ -203,8 +298,11 @@ class Store:
         except Exception as exc:  # noqa: BLE001 — surfaced as a persisted warning, never silently dropped
             message = f"stored state for session {session_id} failed validation and could not be loaded: {exc}"
             log.warning(message)
-            self.log_event(session_id, EventType.WARNING, {"message": message, "source": "store.load_state",
-                                                           "error": f"{type(exc).__name__}: {exc}"})
+            self.log_event(
+                session_id,
+                EventType.WARNING,
+                {"message": message, "source": "store.load_state", "error": f"{type(exc).__name__}: {exc}"},
+            )
             return None
 
     def save_state(self, state: SessionState) -> None:
@@ -214,26 +312,40 @@ class Store:
             self._conn.execute(
                 "UPDATE sessions SET title=?, brief=?, phase=?, status=?, awaiting=?, updated_at=?, state_json=?"
                 " WHERE id=?",
-                (state.title, state.brief, state.phase.value, state.status.value, state.awaiting.value,
-                 state.updated_at, payload, state.session_id),
+                (
+                    state.title,
+                    state.brief,
+                    state.phase.value,
+                    state.status.value,
+                    state.awaiting.value,
+                    state.updated_at,
+                    payload,
+                    state.session_id,
+                ),
             )
             self._conn.commit()
         self.trim_events(state.session_id, keep=self.event_retention)
 
-    def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_sessions(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of sessions, newest first. Pair with :meth:`count_sessions` for pagination."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id,title,brief,phase,status,awaiting,created_at,updated_at FROM sessions"
-                " ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_sessions(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
 
     def session_ids_with_status(self, status: str) -> list[str]:
         """Every session in *status*, regardless of how many sessions exist (used on startup recovery)."""
         with self._lock:
-            rows = self._conn.execute("SELECT id FROM sessions WHERE status = ? ORDER BY created_at",
-                                      (status,)).fetchall()
+            rows = self._conn.execute(
+                "SELECT id FROM sessions WHERE status = ? ORDER BY created_at", (status,)
+            ).fetchall()
         return [str(row["id"]) for row in rows]
 
     def delete_session(self, session_id: str) -> bool:
@@ -254,13 +366,24 @@ class Store:
             self._conn.execute(
                 "INSERT INTO qa_pairs (session_id,q_index,subject,question,answer,skipped,na,rationale,round,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (pair.session_id, pair.q_index, pair.subject, pair.question, pair.answer,
-                 int(pair.skipped), int(pair.not_applicable), pair.rationale, pair.round, pair.created_at),
+                (
+                    pair.session_id,
+                    pair.q_index,
+                    pair.subject,
+                    pair.question,
+                    pair.answer,
+                    int(pair.skipped),
+                    int(pair.not_applicable),
+                    pair.rationale,
+                    pair.round,
+                    pair.created_at,
+                ),
             )
             self._conn.commit()
 
-    def update_qa_answer(self, session_id: str, q_index: int, answer: str | None,
-                         skipped: bool = False, not_applicable: bool = False) -> None:
+    def update_qa_answer(
+        self, session_id: str, q_index: int, answer: str | None, skipped: bool = False, not_applicable: bool = False
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 "UPDATE qa_pairs SET answer=?, skipped=?, na=? WHERE session_id=? AND q_index=?",
@@ -277,9 +400,10 @@ class Store:
 
     # -- events -------------------------------------------------------------
 
-    def log_event(self, session_id: str, event_type: str, payload: dict[str, Any] | None = None, *,
-                  role: str = "", step: str = "") -> int:
-        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    def log_event(
+        self, session_id: str, event_type: str, payload: dict[str, Any] | None = None, *, role: str = "", step: str = ""
+    ) -> int:
+        ts = datetime.now(UTC).isoformat(timespec="milliseconds")
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO events (session_id,ts,type,role,step,payload) VALUES (?,?,?,?,?,?)",
@@ -299,7 +423,7 @@ class Store:
             item = dict(row)
             try:
                 item["payload"] = json.loads(item.get("payload") or "{}")
-            except Exception:
+            except Exception:  # noqa: BLE001 - corrupt event payload -> empty payload, keep the event
                 item["payload"] = {}
             out.append(item)
         return out
@@ -327,8 +451,15 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO artifacts (session_id,name,kind,path,bytes,sha256,created_at)"
                 " VALUES (?,?,?,?,?,?,?)",
-                (session_id, artifact.name, artifact.kind, artifact.path, artifact.bytes,
-                 artifact.sha256, artifact.created_at),
+                (
+                    session_id,
+                    artifact.name,
+                    artifact.kind,
+                    artifact.path,
+                    artifact.bytes,
+                    artifact.sha256,
+                    artifact.created_at,
+                ),
             )
             self._conn.commit()
 
@@ -339,6 +470,66 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    # -- lessons ------------------------------------------------------------
+
+    def add_lesson(self, session_id: str, kind: str, text: str) -> int:
+        """Record one reusable lesson from a finished run (a recurring gap, a critic finding, a stakeholder
+        correction).
+
+        A repeated lesson updates the existing row's counter rather than adding a duplicate, so the store
+        stays small and "how often has this happened" is answerable. Empty text is ignored so callers can be
+        casual about it. Returns the row id, or 0 for empty text.
+        """
+        text = (text or "").strip()
+        if not text:
+            return 0
+        ts = datetime.now(UTC).isoformat(timespec="seconds")
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO lessons (session_id, kind, text, created_at, seen_count, updated_at)
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT (kind, text) DO UPDATE
+                SET seen_count = lessons.seen_count + 1,
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, kind, text, ts, ts),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    def list_lessons(
+        self,
+        limit: int = 20,
+        kinds: Sequence[str] | None = None,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lessons, ranked by how often they have recurred, then by recency.
+
+        Rows are already unique per (kind, text), so no dedup happens here. `session_id` narrows the query to
+        the run that last reinforced each lesson — useful for a UI panel that wants "what did this run learn".
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kinds:
+            clauses.append("kind IN (" + ",".join("?" for _ in kinds) + ")")
+            params.extend(kinds)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM lessons {where} ORDER BY seen_count DESC, updated_at DESC LIMIT ?",
+                (*params, max(1, limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_lessons(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) AS n FROM lessons").fetchone()["n"])
+
     # -- knowledge base -----------------------------------------------------
 
     def kb_hashes(self) -> dict[str, str]:
@@ -347,9 +538,19 @@ class Store:
             rows = self._conn.execute("SELECT source, uri, sha256 FROM kb_docs").fetchall()
         return {f"{row['source']}::{row['uri']}": row["sha256"] for row in rows}
 
-    def kb_upsert_doc(self, *, doc_id: str, source: str, uri: str, sha256: str, title: str,
-                      size_bytes: int, chunks: int, embedded: bool) -> None:
-        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    def kb_upsert_doc(
+        self,
+        *,
+        doc_id: str,
+        source: str,
+        uri: str,
+        sha256: str,
+        title: str,
+        size_bytes: int,
+        chunks: int,
+        embedded: bool,
+    ) -> None:
+        ts = datetime.now(UTC).isoformat(timespec="seconds")
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO kb_docs (id,source,uri,sha256,title,bytes,chunks,embedded,indexed_at)"
@@ -364,8 +565,16 @@ class Store:
             rows = []
             for index, (text, meta, embedding) in enumerate(chunks):
                 blob = sqlite3.Binary(_pack_vector(embedding)) if embedding else None
-                rows.append((doc_id, index, text, json.dumps(meta, ensure_ascii=False), blob,
-                             len(embedding) if embedding else 0))
+                rows.append(
+                    (
+                        doc_id,
+                        index,
+                        text,
+                        json.dumps(meta, ensure_ascii=False),
+                        blob,
+                        len(embedding) if embedding else 0,
+                    )
+                )
             self._conn.executemany(
                 "INSERT INTO kb_chunks (doc_id,chunk_index,text,meta,embedding,dim) VALUES (?,?,?,?,?,?)", rows
             )
@@ -374,8 +583,9 @@ class Store:
     def kb_find_doc_by_digest(self, sha256: str) -> dict[str, Any] | None:
         """The already-indexed document whose content hash is *sha256*, if any (upload dedup)."""
         with self._lock:
-            row = self._conn.execute("SELECT id, source, uri, title FROM kb_docs WHERE sha256=? LIMIT 1",
-                                     (sha256,)).fetchone()
+            row = self._conn.execute(
+                "SELECT id, source, uri, title FROM kb_docs WHERE sha256=? LIMIT 1", (sha256,)
+            ).fetchone()
         return dict(row) if row else None
 
     def kb_delete_doc(self, doc_id: str) -> None:
@@ -395,7 +605,7 @@ class Store:
             item["vector"] = _unpack_vector(item.pop("embedding"))
             try:
                 item["meta"] = json.loads(item.get("meta") or "{}")
-            except Exception:
+            except Exception:  # noqa: BLE001 - corrupt chunk metadata -> empty metadata, keep the chunk
                 item["meta"] = {}
             out.append(item)
         return out
@@ -414,7 +624,7 @@ class Store:
             return default
         try:
             return json.loads(row["value"])
-        except Exception:
+        except Exception:  # noqa: BLE001 - settings are stored as JSON but legacy values may be plain text
             return row["value"]
 
     def set_setting(self, key: str, value: Any) -> None:

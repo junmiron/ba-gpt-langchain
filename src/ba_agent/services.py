@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 from .config import AppConfig, get_config
 from .knowledge import KnowledgeService
 from .models import ModelGateway, get_gateway
+from .retriever import KnowledgeRetriever
 from .store import Store
 from .tools.sandbox import Sandbox, get_sandbox
 
@@ -29,8 +31,13 @@ class Services:
     knowledge: KnowledgeService
     sandbox: Sandbox
 
+    @cached_property
+    def retriever(self) -> KnowledgeRetriever:
+        """The knowledge base as a ``langchain-core`` Runnable (Phase 1.1)."""
+        return KnowledgeRetriever(knowledge=self.knowledge, top_k=self.config.knowledge.top_k)
+
     @classmethod
-    def create(cls, config: AppConfig | None = None) -> "Services":
+    def create(cls, config: AppConfig | None = None) -> Services:
         cfg = config or get_config()
         store = Store(cfg.db_path)
         gateway = get_gateway(cfg)

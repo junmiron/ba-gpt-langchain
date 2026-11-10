@@ -21,13 +21,12 @@ import uvicorn
 from ba_agent import server as server_package
 from ba_agent.events import DEFAULT_FANOUT_CAPACITY, EventFanout, EventType
 from ba_agent.jsonx import extract_json
-from ba_agent.knowledge import (MAX_FETCH_BYTES, KnowledgeService, UnsafeURLError, check_fetch_url, fetch_url)
+from ba_agent.knowledge import MAX_FETCH_BYTES, KnowledgeService, UnsafeURLError, check_fetch_url, fetch_url
 from ba_agent.sanitize import sanitize_svg
 from ba_agent.server.app import DELIVERABLE_CSP, REPLAY_PAGE_SIZE, create_app
 from ba_agent.services import Services
 from ba_agent.store import SCHEMA_VERSION, Store
 from conftest import FakeGateway
-
 
 # --------------------------------------------------------------------------- helpers
 
@@ -53,8 +52,9 @@ def live(config, monkeypatch):
     monkeypatch.setattr(server_package.app, "Services", SimpleNamespace(create=create_with_fake))
     app = create_app(config)
     port = _free_port()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error",
-                                           lifespan="on", access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", lifespan="on", access_log=False)
+    )
     thread = threading.Thread(target=server.run, name="ba-fix-server", daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{port}"
@@ -117,8 +117,9 @@ def test_s1_last_event_id_header_is_honoured_when_no_query_cursor(live):
     all_ids = [e["id"] for e in manager.events_after(state.session_id, 0, 100)]
     cursor = all_ids[4]
 
-    with client.stream("GET", f"/api/sessions/{state.session_id}/stream",
-                       headers={"Last-Event-ID": str(cursor)}) as response:
+    with client.stream(
+        "GET", f"/api/sessions/{state.session_id}/stream", headers={"Last-Event-ID": str(cursor)}
+    ) as response:
         seen: list[int] = []
         for line in response.iter_lines():
             if line.startswith("id: "):
@@ -135,8 +136,9 @@ def test_s1_stale_query_cursor_does_not_override_a_newer_last_event_id(live):
     _seed_events(manager.services.store, state.session_id, 12)
     all_ids = [e["id"] for e in manager.events_after(state.session_id, 0, 100)]
 
-    with client.stream("GET", f"/api/sessions/{state.session_id}/stream?after=0",
-                       headers={"Last-Event-ID": str(all_ids[7])}) as response:
+    with client.stream(
+        "GET", f"/api/sessions/{state.session_id}/stream?after=0", headers={"Last-Event-ID": str(all_ids[7])}
+    ) as response:
         seen: list[int] = []
         for line in response.iter_lines():
             if line.startswith("id: "):
@@ -150,8 +152,9 @@ def test_s1_malformed_cursor_is_treated_as_from_start(live):
     client, manager = live
     state = manager.services.store.create_session(brief="garbage cursor")
     _seed_events(manager.services.store, state.session_id, 3)
-    with client.stream("GET", f"/api/sessions/{state.session_id}/stream",
-                       headers={"Last-Event-ID": "not-a-number"}) as response:
+    with client.stream(
+        "GET", f"/api/sessions/{state.session_id}/stream", headers={"Last-Event-ID": "not-a-number"}
+    ) as response:
         assert response.status_code == 200
         seen = []
         for line in response.iter_lines():
@@ -217,11 +220,10 @@ def test_s3_chat_step_is_implemented_and_runs_through_the_background_path(servic
             emitted.append(event_type)
 
         # The background entry point used by _run("chat") must exist and must not deadlock on runtime.lock.
-        await asyncio.wait_for(manager._run_chat(manager.runtimes[state.session_id], "hello there", emit),
-                               timeout=20)
+        await asyncio.wait_for(manager._run_chat(manager.runtimes[state.session_id], "hello there", emit), timeout=20)
         return emitted
 
-    emitted = asyncio.run(scenario())
+    asyncio.run(scenario())
     assert hasattr(manager, "_chat_step")
     kinds = [e["type"] for e in manager.services.store.get_events(state.session_id, 0, 100)]
     assert EventType.ANSWER in kinds and EventType.SESSION in kinds
@@ -257,15 +259,18 @@ def test_s4_cancel_from_a_foreign_origin_is_refused(live):
 
 
 # Each body is *valid* for its route, so the origin guard (not body validation) is what decides the outcome.
-@pytest.mark.parametrize("path,body", [
-    ("/api/sessions/x/resume", None),
-    ("/api/sessions/x/answer", {"question_id": 1, "answer": "yes"}),
-    ("/api/sessions/x/approve", {"approved": True}),
-    ("/api/sessions/x/chat", {"message": "hello"}),
-    ("/api/knowledge/index", {"urls": []}),
-    ("/api/models", {"default_model": "m"}),
-    ("/api/sessions", {"brief": "a valid brief"}),
-])
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/api/sessions/x/resume", None),
+        ("/api/sessions/x/answer", {"question_id": 1, "answer": "yes"}),
+        ("/api/sessions/x/approve", {"approved": True}),
+        ("/api/sessions/x/chat", {"message": "hello"}),
+        ("/api/knowledge/index", {"urls": []}),
+        ("/api/models", {"default_model": "m"}),
+        ("/api/sessions", {"brief": "a valid brief"}),
+    ],
+)
 def test_s4_every_state_changing_route_refuses_a_foreign_origin(live, path, body):
     client, _ = live
     response = client.post(path, json=body, headers={"Origin": "https://evil.example"})
@@ -274,15 +279,19 @@ def test_s4_every_state_changing_route_refuses_a_foreign_origin(live, path, body
 
 def test_s4_upload_from_a_foreign_origin_is_refused(live):
     client, _ = live
-    response = client.post("/api/knowledge/upload", files={"files": ("a.md", b"x", "text/markdown")},
-                           headers={"Origin": "https://evil.example"})
+    response = client.post(
+        "/api/knowledge/upload",
+        files={"files": ("a.md", b"x", "text/markdown")},
+        headers={"Origin": "https://evil.example"},
+    )
     assert response.status_code == 403
 
 
 def test_s4_same_origin_and_originless_requests_still_work(live):
     client, _ = live
-    own = client.post("/api/sessions", json={"brief": "same origin ok"},
-                      headers={"Origin": str(client.base_url).rstrip("/")})
+    own = client.post(
+        "/api/sessions", json={"brief": "same origin ok"}, headers={"Origin": str(client.base_url).rstrip("/")}
+    )
     assert own.status_code == 200, own.text
     plain = client.post("/api/sessions", json={"brief": "no origin header"})
     assert plain.status_code == 200, plain.text
@@ -303,8 +312,9 @@ def test_s4_explicit_origin_gets_cors_headers(config):
     async def preflight(origin: str) -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as client:
-            return await client.options("/api/health", headers={"Origin": origin,
-                                                                "Access-Control-Request-Method": "GET"})
+            return await client.options(
+                "/api/health", headers={"Origin": origin, "Access-Control-Request-Method": "GET"}
+            )
 
     allowed = asyncio.run(preflight("http://127.0.0.1:8765"))
     foreign = asyncio.run(preflight("https://evil.example"))
@@ -353,7 +363,7 @@ def test_s5_distinct_content_is_stored_separately(config, services):
 
 
 def test_s5_multipart_upload_over_http_is_stored_and_listed(live):
-    client, manager = live
+    client, _manager = live
     response = client.post("/api/knowledge/upload", files={"files": ("notes.txt", b"alpha beta gamma", "text/plain")})
     assert response.status_code == 200, response.text
     assert response.json()["results"][0]["ok"] is True
@@ -362,20 +372,23 @@ def test_s5_multipart_upload_over_http_is_stored_and_listed(live):
 # --------------------------------------------------------------------------- S6: SSRF guard
 
 
-@pytest.mark.parametrize("url", [
-    "http://127.0.0.1/admin",
-    "http://127.0.0.1:8765/api/health",
-    "http://localhost/secret",
-    "http://10.0.0.5/internal",
-    "http://192.168.1.10/router",
-    "http://172.16.4.2/x",
-    "http://169.254.169.254/latest/meta-data/",
-    "http://[::1]/x",
-    "http://0.0.0.0/x",
-    "file:///etc/passwd",
-    "ftp://example.com/x",
-    "gopher://example.com/x",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/admin",
+        "http://127.0.0.1:8765/api/health",
+        "http://localhost/secret",
+        "http://10.0.0.5/internal",
+        "http://192.168.1.10/router",
+        "http://172.16.4.2/x",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/x",
+        "http://0.0.0.0/x",
+        "file:///etc/passwd",
+        "ftp://example.com/x",
+        "gopher://example.com/x",
+    ],
+)
 def test_s6_private_loopback_and_non_http_urls_are_rejected(url):
     with pytest.raises(UnsafeURLError):
         check_fetch_url(url, resolver=lambda host: ["93.184.216.34"])
@@ -430,8 +443,9 @@ def test_s6_response_larger_than_the_cap_is_refused(monkeypatch):
             return httpx.Response(200, content=payload, headers={"content-type": "text/plain"}, request=request)
 
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(knowledge.httpx, "AsyncClient",
-                        lambda **kw: real_client(**{**kw, "transport": FakeTransport()}))
+    monkeypatch.setattr(
+        knowledge.httpx, "AsyncClient", lambda **kw: real_client(**{**kw, "transport": FakeTransport()})
+    )
 
     async def scenario():
         with pytest.raises(UnsafeURLError, match="larger than"):
@@ -449,8 +463,9 @@ def test_s6_ordinary_public_page_is_still_fetched(monkeypatch):
             return httpx.Response(200, text=body, headers={"content-type": "text/html"}, request=request)
 
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(knowledge.httpx, "AsyncClient",
-                        lambda **kw: real_client(**{**kw, "transport": FakeTransport()}))
+    monkeypatch.setattr(
+        knowledge.httpx, "AsyncClient", lambda **kw: real_client(**{**kw, "transport": FakeTransport()})
+    )
 
     async def scenario():
         return await fetch_url("https://example.com/guide", resolver=lambda host: ["93.184.216.34"])
@@ -488,16 +503,26 @@ def test_s7_sanitize_svg_removes_script_style_and_event_attributes():
 
 
 def test_s7_sanitize_svg_keeps_a_benign_diagram():
-    benign = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
-              '<g id="a"><rect x="1" y="1" width="4" height="4" fill="#fff"/><text x="2" y="4">Stage</text></g>'
-              '<a href="#a"><circle cx="5" cy="5" r="1"/></a></svg>')
+    benign = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+        '<g id="a"><rect x="1" y="1" width="4" height="4" fill="#fff"/><text x="2" y="4">Stage</text></g>'
+        '<a href="#a"><circle cx="5" cy="5" r="1"/></a></svg>'
+    )
     cleaned = sanitize_svg(benign)
     assert "<rect" in cleaned and "Stage" in cleaned and 'href="#a"' in cleaned
 
 
-@pytest.mark.parametrize("bad", ["", None, "not svg at all", "<html><script>x</script></html>",
-                                 "<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><svg>&x;</svg>",
-                                 "<svg><unclosed>"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        None,
+        "not svg at all",
+        "<html><script>x</script></html>",
+        "<!DOCTYPE svg [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><svg>&x;</svg>",
+        "<svg><unclosed>",
+    ],
+)
 def test_s7_unparseable_or_hostile_input_yields_nothing(bad):
     assert sanitize_svg(bad) == ""
 
@@ -508,7 +533,8 @@ def test_s7_served_deliverable_has_csp_and_sanitised_svg(live):
     directory = manager.services.config.session_dir(state.session_id)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "deliverable.html").write_text(
-        "<html><body><p>spec</p>" + MALICIOUS_SVG + "</body></html>", encoding="utf-8")
+        "<html><body><p>spec</p>" + MALICIOUS_SVG + "</body></html>", encoding="utf-8"
+    )
 
     response = client.get(f"/api/artifacts/{state.session_id}/deliverable.html")
     assert response.status_code == 200
@@ -574,8 +600,10 @@ def test_s8_schema_version_is_recorded_and_stable(tmp_path):
 def test_s8_legacy_database_without_version_table_is_migrated(tmp_path):
     path = tmp_path / "legacy.sqlite"
     conn = sqlite3.connect(str(path))
-    conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, brief TEXT, phase TEXT, status TEXT, "
-                       "awaiting TEXT, created_at TEXT, updated_at TEXT, state_json TEXT);")
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, brief TEXT, phase TEXT, status TEXT, "
+        "awaiting TEXT, created_at TEXT, updated_at TEXT, state_json TEXT);"
+    )
     conn.commit()
     conn.close()
     store = Store(path)
@@ -611,8 +639,9 @@ def test_s8_mark_interrupted_finds_a_run_outside_the_500_most_recent(services):
 
 def test_s8_load_state_logs_a_warning_instead_of_silently_returning_none(services):
     state = services.store.create_session(brief="corrupt me")
-    services.store._conn.execute("UPDATE sessions SET state_json=? WHERE id=?",
-                                 ('{"session_id": "x", "phase": "not-a-phase"}', state.session_id))
+    services.store._conn.execute(
+        "UPDATE sessions SET state_json=? WHERE id=?", ('{"session_id": "x", "phase": "not-a-phase"}', state.session_id)
+    )
     services.store._conn.commit()
 
     assert services.store.load_state(state.session_id) is None
@@ -631,7 +660,7 @@ def test_s9_string_contents_survive_repair_untouched():
 
 
 def test_s9_apostrophe_inside_double_quoted_value_is_not_corrupted():
-    text = "Here you go: {\"text\": \"the client's portal isn't live\"}"
+    text = 'Here you go: {"text": "the client\'s portal isn\'t live"}'
     assert extract_json(text) == {"text": "the client's portal isn't live"}
 
 
@@ -681,7 +710,7 @@ def test_s10_ci_workflow_matrix_and_offline_steps_are_declared():
     spec = yaml.safe_load(workflow.read_text(encoding="utf-8"))
     job = next(iter(spec["jobs"].values()))
     versions = job["strategy"]["matrix"]["python-version"]
-    assert {"3.11", "3.13"} <= set(str(v) for v in versions)
+    assert {"3.11", "3.13"} <= {str(v) for v in versions}
     run_text = "\n".join(step.get("run", "") for step in job["steps"])
     assert 'pip install -e ".[dev]"' in run_text or "pip install -e ." in run_text
     assert "pytest -q" in run_text
@@ -693,15 +722,17 @@ def test_s5_body_is_cut_off_before_being_read_in_full():
     Measured on the server side: the counter increments only when the guard itself pulls a chunk from the
     request stream. (A client-side counter would measure how far the test client's generator ran ahead.)
     """
-    from starlette.datastructures import Headers
     from fastapi import HTTPException
+    from starlette.datastructures import Headers
 
     from ba_agent.server.app import MAX_UPLOAD_BYTES, _read_capped_uploads
 
     boundary = "BOUNDARY123"
-    head = (b"--" + boundary.encode() + b"\r\n"
-            b'Content-Disposition: form-data; name="files"; filename="huge.txt"\r\n'
-            b"Content-Type: text/plain\r\n\r\n")
+    head = (
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="files"; filename="huge.txt"\r\n'
+        b"Content-Type: text/plain\r\n\r\n"
+    )
     tail = b"\r\n--" + boundary.encode() + b"--\r\n"
     chunk = b"x" * (1024 * 1024)
     total_chunks = 60  # 60 MB offered; the cap is 25 MB
@@ -727,4 +758,5 @@ def test_s5_body_is_cut_off_before_being_read_in_full():
 
     assert asyncio.run(scenario()) == 413
     assert pulled["bytes"] < MAX_UPLOAD_BYTES + 4 * 1024 * 1024, (
-        f"pulled {pulled['bytes']} bytes before rejecting; expected to stop near the cap")
+        f"pulled {pulled['bytes']} bytes before rejecting; expected to stop near the cap"
+    )

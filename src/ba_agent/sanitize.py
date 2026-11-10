@@ -14,13 +14,48 @@ from xml.etree import ElementTree as ET
 SVG_NS = "http://www.w3.org/2000/svg"
 
 #: Elements that are removed together with their content.
-_DROP_ELEMENTS = {"script", "style", "foreignobject", "iframe", "object", "embed", "audio", "video", "image",
-                  "use", "handler", "listener", "set", "animate", "animatemotion", "animatetransform", "link",
-                  "meta", "base", "form", "input", "textarea", "button", "select"}
+_DROP_ELEMENTS = {
+    "script",
+    "style",
+    "foreignobject",
+    "iframe",
+    "object",
+    "embed",
+    "audio",
+    "video",
+    "image",
+    "use",
+    "handler",
+    "listener",
+    "set",
+    "animate",
+    "animatemotion",
+    "animatetransform",
+    "link",
+    "meta",
+    "base",
+    "form",
+    "input",
+    "textarea",
+    "button",
+    "select",
+}
 
 #: Attributes that may hold a URL; a ``javascript:``/``data:`` value makes them unsafe.
-_URL_ATTRIBUTES = {"href", "src", "xlink:href", "action", "formaction", "data", "background", "poster", "to",
-                   "from", "values", "by"}
+_URL_ATTRIBUTES = {
+    "href",
+    "src",
+    "xlink:href",
+    "action",
+    "formaction",
+    "data",
+    "background",
+    "poster",
+    "to",
+    "from",
+    "values",
+    "by",
+}
 
 _UNSAFE_URL_RE = re.compile(r"^\s*(javascript|vbscript|data)\s*:", re.IGNORECASE)
 _CSS_EXPR_RE = re.compile(r"(expression\s*\(|javascript\s*:|url\s*\(\s*['\"]?\s*(javascript|data)\s*:)", re.I)
@@ -43,11 +78,11 @@ def _sanitize_attrs(element: ET.Element) -> None:
     for name in list(element.attrib):
         lname = name.rsplit("}", 1)[-1].lower()
         value = element.attrib[name]
-        if lname.startswith("on"):  # onload, onclick, onmouseover, …
-            del element.attrib[name]
-        elif lname in _URL_ATTRIBUTES and _UNSAFE_URL_RE.match(value):
-            del element.attrib[name]
-        elif lname == "style" and _CSS_EXPR_RE.search(value):
+        if (
+            lname.startswith("on")
+            or (lname in _URL_ATTRIBUTES and _UNSAFE_URL_RE.match(value))
+            or (lname == "style" and _CSS_EXPR_RE.search(value))
+        ):  # onload, onclick, onmouseover, …
             del element.attrib[name]
         elif lname in ("href", "xlink:href") and not value.lstrip().startswith("#"):
             # Only in-document fragments are legitimate inside an inline diagram.

@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import secrets
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,10 +23,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .. import __version__
-from ..config import AppConfig, get_config
-from ..events import EventFanout
-from ..knowledge import KnowledgeService
+from ..artifacts import pdf_engine
+from ..artifacts.typst import find_typst
+from ..config import AppConfig, configure_logging, get_config
 from ..runtime import SessionManager
+from ..schemas import Phase, Priority
 from ..services import Services
 from ..spec import spec_stats
 from ..tools.sandbox import SandboxError
@@ -42,9 +45,11 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_UPLOAD_FILES = 20
 #: Content-Security-Policy for the served deliverable: same-origin resources only, no script from anywhere but the
 #: page itself (its own inline script is needed for the Markdown view), no plugins, no framing, no form posts.
-DELIVERABLE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-                   "img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; "
-                   "frame-ancestors 'none'")
+DELIVERABLE_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; "
+    "frame-ancestors 'none'"
+)
 
 
 def _parse_cursor(value: Any) -> int:
@@ -59,10 +64,15 @@ def _parse_cursor(value: Any) -> int:
 
 
 class CreateSessionRequest(BaseModel):
-    brief: str = Field(min_length=4, description="What the project is about, in the stakeholder's own words.")
+    #: A brief is optional when a transcript is supplied — one of the two must be present.
+    brief: str = Field(default="", description="What the project is about, in the stakeholder's own words.")
     title: str = ""
     urls: list[str] = Field(default_factory=list, description="Optional reference pages to index before starting.")
     model_overrides: dict[str, str] = Field(default_factory=dict)
+    #: An elicitation transcript (meeting notes, a prior interview, a discovery-call log). When supplied the
+    # engine triages it into the ledger and the interview only asks about what it left open.
+    transcript: str = Field(default="", max_length=200000)
+    transcript_source: str = Field(default="", max_length=200)
 
 
 class AnswerRequest(BaseModel):
@@ -77,6 +87,18 @@ class ApproveRequest(BaseModel):
     notes: str = ""
 
 
+class RenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class LedgerEditRequest(BaseModel):
+    title: str | None = None
+    body: str | None = None
+    category: str | None = None
+    priority: Priority | None = None
+    acceptance: list[str] | None = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
 
@@ -84,11 +106,22 @@ class ChatRequest(BaseModel):
 class ModelsRequest(BaseModel):
     default_model: str | None = None
     overrides: dict[str, str] | None = None
+    embedding_model: str | None = None
+    provider: str | None = None
 
 
 class IndexRequest(BaseModel):
     directory: str | None = None
     urls: list[str] = Field(default_factory=list)
+
+
+class SettingsRequest(BaseModel):
+    """Partial patch of the run budgets the UI is allowed to change (see SessionManager.SETTABLE)."""
+
+    interview: dict[str, Any] | None = None
+    review: dict[str, Any] | None = None
+    diagram: dict[str, Any] | None = None
+    knowledge: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------- app factory
@@ -99,13 +132,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Every module logs through the stdlib logger; without this the warnings the workflow emits
+        # (corrupt stored settings, ignored env vars, embedding failures) only reach stderr through
+        # uvicorn's own config and are lost for post-mortems. `configure_logging` is idempotent, so
+        # calling it here and in the CLI is safe.
+        configure_logging(cfg)
         services = Services.create(cfg)
         manager = SessionManager(services)
+        manager.restore_run_settings()
         interrupted = manager.mark_interrupted()
-        stored_overrides = services.store.get_setting("model_overrides", {}) or {}
-        if stored_overrides:
-            for role, model in stored_overrides.items():
-                cfg.roles.setdefault(role, cfg.role(role)).model = model
         app.state.services = services
         app.state.manager = manager
         if interrupted:
@@ -121,11 +156,40 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     # state-changing requests are rejected separately by _require_same_origin (CSRF).
     cors_origins = [o for o in cfg.server.cors_origins if o != "*"]
     if cors_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=cors_origins, allow_credentials=True,
-                           allow_methods=["*"], allow_headers=["*"])
+        app.add_middleware(
+            CORSMiddleware, allow_origins=cors_origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+        )
 
     def mgr(request: Request) -> SessionManager:
-        return request.app.state.manager  # type: ignore[return-value]
+        return request.app.state.manager
+
+    #: Timing-safe comparison so a token guess against a local port cannot be turned into a length oracle.
+    def _token_ok(request: Request) -> bool:
+        supplied = request.headers.get("authorization", "")
+        if supplied.lower().startswith("bearer "):
+            supplied = supplied[7:]
+        else:
+            supplied = request.headers.get("x-api-key", "")
+        # `EventSource` cannot send headers, so the SSE stream accepts the token as a query parameter.
+        if not supplied:
+            supplied = request.query_params.get("token", "")
+        return secrets.compare_digest(supplied.strip(), cfg.server.auth_token)
+
+    if cfg.server.auth_token:
+
+        @app.middleware("http")
+        async def require_token(request: Request, call_next):
+            """Gate the API when a token is configured. The static UI stays open so it can prompt for the token.
+
+            Off by default: this tool is localhost-only, and an unauthenticated API on `127.0.0.1` is a
+            reasonable default. Set `server.auth_token` (or `BA_AGENT_TOKEN`) before exposing it to a network.
+            """
+            if request.url.path.startswith("/api") and not _token_ok(request):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "missing or invalid API token", "hint": "send Authorization: Bearer <token>"},
+                )
+            return await call_next(request)
 
     def _require_same_origin(request: Request) -> None:
         """Refuse state-changing requests whose ``Origin`` is not this server (CSRF defence, localhost-only).
@@ -151,35 +215,107 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     async def health(request: Request) -> dict[str, Any]:
         manager = mgr(request)
         gateway_health = await manager.gateway.health()
-        return {"status": "ok" if gateway_health["reachable"] else "backend_unreachable",
-                "version": __version__, "gateway": gateway_health,
-                "knowledge": manager.services.knowledge.status(),
-                "config": {"max_questions_per_subject": cfg.interview.max_questions_per_subject,
-                           "max_gap_rounds": cfg.interview.max_gap_rounds,
-                           "max_review_rounds": cfg.review.max_review_rounds,
-                           "max_concurrency": cfg.active_profile.max_concurrency}}
+        return {
+            "status": "ok" if gateway_health["reachable"] else "backend_unreachable",
+            "version": __version__,
+            "gateway": gateway_health,
+            "knowledge": manager.services.knowledge.status(),
+            # Which renderer a deliverable will actually use. Typst needs a binary; ReportLab is pure
+            # Python. Reporting it up front beats discovering the fallback at export time.
+            "pdf": {
+                "engine": pdf_engine(),
+                "typst_binary": find_typst(),
+            },
+            "config": {
+                "max_questions_per_subject": cfg.interview.max_questions_per_subject,
+                "max_gap_rounds": cfg.interview.max_gap_rounds,
+                "max_review_rounds": cfg.review.max_review_rounds,
+                "max_concurrency": cfg.active_profile.max_concurrency,
+            },
+        }
 
     @app.get("/api/models")
     async def models(request: Request) -> dict[str, Any]:
         manager = mgr(request)
         catalog = await manager.gateway.list_models(refresh=True)
         settings = manager.model_settings()
-        return {"provider": cfg.provider, "base_url": cfg.active_profile.base_url, "reachable": bool(catalog),
-                "chat_models": [m.model_dump() for m in catalog if m.is_chat],
-                "embedding_models": [m.model_dump() for m in catalog if not m.is_chat],
-                "default_model": settings["default_model"], "overrides": settings["overrides"],
-                "roles": settings["roles"], "embedding_model": settings["embedding_model"]}
+        return {
+            "provider": cfg.provider,
+            "base_url": cfg.active_profile.base_url,
+            "reachable": bool(catalog),
+            "chat_models": [m.model_dump() for m in catalog if m.is_chat],
+            "embedding_models": [m.model_dump() for m in catalog if not m.is_chat],
+            "default_model": settings["default_model"],
+            "overrides": settings["overrides"],
+            "roles": settings["roles"],
+            "embedding_model": settings["embedding_model"],
+        }
 
     @app.post("/api/models")
     async def set_models(request: Request, payload: ModelsRequest = Body(...)) -> dict[str, Any]:
         _require_same_origin(request)
-        return await mgr(request).set_models(payload.default_model, payload.overrides)
+        try:
+            return await mgr(request).set_models(
+                payload.default_model, payload.overrides, payload.embedding_model, payload.provider
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/settings")
+    async def get_settings(request: Request) -> dict[str, Any]:
+        manager = mgr(request)
+        return {
+            "settings": manager.run_settings(),
+            "editable": {section: list(keys) for section, keys in manager.SETTABLE.items()},
+            "models": manager.model_settings(),
+        }
+
+    @app.patch("/api/settings")
+    async def patch_settings(request: Request, payload: SettingsRequest = Body(...)) -> dict[str, Any]:
+        _require_same_origin(request)
+        patch_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+        if not patch_data:
+            raise HTTPException(status_code=400, detail="nothing to change")
+        try:
+            applied = mgr(request).update_run_settings(patch_data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"settings": applied}
+
+    @app.post("/api/settings/reset")
+    async def reset_settings(request: Request) -> dict[str, Any]:
+        # Clears the stored delta so config.yaml's defaults apply again.
+        _require_same_origin(request)
+        return {"settings": mgr(request).reset_run_settings()}
+
+    @app.get("/api/lessons")
+    async def list_lessons(
+        request: Request,
+        limit: int = 20,
+        kind: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """The feedback store: what previous runs missed, reused as pinned context in the next plan prompt.
+
+        `session_id` narrows it to one run; `total` always counts the whole store.
+        """
+        manager = mgr(request)
+        rows = manager.services.store.list_lessons(limit=limit, kinds=[kind] if kind else None, session_id=session_id)
+        return {"total": manager.services.store.count_lessons(), "lessons": rows}
 
     # -- sessions -----------------------------------------------------------
 
     @app.get("/api/sessions")
-    async def list_sessions(request: Request, limit: int = 100) -> list[dict[str, Any]]:
-        return mgr(request).list_sessions(limit=limit)
+    async def list_sessions(request: Request, limit: int = 50, offset: int = 0) -> JSONResponse:
+        manager = mgr(request)
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        rows = manager.list_sessions(limit=limit, offset=offset)
+        for row in rows:
+            # The sidebar needs to know whether a run is mid-flight, which the store row does not carry.
+            runtime = manager.runtimes.get(row["id"])
+            row["busy"] = bool(runtime and runtime.busy)
+        return JSONResponse(rows, headers={"X-Total-Count": str(manager.session_count())})
 
     @app.post("/api/sessions")
     async def create_session(request: Request, payload: CreateSessionRequest) -> dict[str, Any]:
@@ -188,8 +324,15 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         indexed = None
         if payload.urls:
             indexed = await manager.services.knowledge.index_urls(payload.urls)
-        state = await manager.create_session(brief=payload.brief, title=payload.title,
-                                             model_overrides=payload.model_overrides)
+        if not payload.brief.strip() and not payload.transcript.strip():
+            raise HTTPException(status_code=400, detail="a session needs a brief or a transcript to work from")
+        state = await manager.create_session(
+            brief=payload.brief,
+            title=payload.title,
+            model_overrides=payload.model_overrides,
+            transcript=payload.transcript,
+            transcript_source=payload.transcript_source,
+        )
         return {"session": _session_summary(manager, state.session_id), "indexed": indexed}
 
     @app.get("/api/sessions/{session_id}")
@@ -200,18 +343,31 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown session")
         return _session_summary(manager, session_id, detailed=True)
 
+    @app.patch("/api/sessions/{session_id}")
+    async def rename_session(request: Request, session_id: str, payload: RenameRequest) -> dict[str, Any]:
+        _require_same_origin(request)
+        if not mgr(request).rename_session(session_id, payload.title):
+            raise HTTPException(status_code=400, detail="title cannot be empty or session unknown")
+        return {"ok": True}
+
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(request: Request, session_id: str) -> dict[str, Any]:
         _require_same_origin(request)
-        await mgr(request).delete_session(session_id)
+        if not await mgr(request).delete_session(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
         return {"ok": True}
 
     @app.post("/api/sessions/{session_id}/answer")
     async def answer(request: Request, session_id: str, payload: AnswerRequest) -> dict[str, Any]:
         _require_same_origin(request)
         try:
-            return await mgr(request).answer(session_id, payload.question_id, answer=payload.answer,
-                                             skipped=payload.skipped, not_applicable=payload.not_applicable)
+            return await mgr(request).answer(
+                session_id,
+                payload.question_id,
+                answer=payload.answer,
+                skipped=payload.skipped,
+                not_applicable=payload.not_applicable,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -275,23 +431,35 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     page = manager.events_after(session_id, after_id=cursor, limit=REPLAY_PAGE_SIZE)
                     for event in page:
                         yield _sse(event)
+                    if page:
+                        cursor = max(cursor, int(page[-1]["id"]))
                     if len(page) < REPLAY_PAGE_SIZE:
                         break
-                    cursor = int(page[-1]["id"])
+
+                # The fanout was subscribed *before* the backlog was read, so anything emitted in that
+                # window is in the queue as well as in the pages just sent. Skip the overlap: an event
+                # with a persisted id at or below the replay cursor has already been delivered. Transient
+                # events (id 0 — streamed tokens) are never persisted, so they are never replayed.
                 while True:
                     if await request.is_disconnected():
                         break
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=20.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         yield ": keep-alive\n\n"
+                        continue
+                    event_id = int(event.get("id", 0) or 0)
+                    if event_id and event_id <= cursor:
                         continue
                     yield _sse(event)
             finally:
                 manager.fanout.unsubscribe(session_id, queue)
 
-        return StreamingResponse(generator(), media_type="text/event-stream", headers={
-            "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
 
     # -- knowledge ----------------------------------------------------------
 
@@ -334,10 +502,65 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         _require_same_origin(request)
         query = str(payload.get("query", ""))
         results = await mgr(request).services.knowledge.search(query, k=int(payload.get("k", 5)))
-        return [{"source": r.source, "title": r.title, "score": round(r.score, 4), "text": r.text[:600]}
-                for r in results]
+        return [
+            {
+                "source": r.source,
+                "title": r.title,
+                "score": round(r.score, 4),
+                "text": r.text[:600],
+                # Which signal actually matched. Without this a run that silently degraded to keyword-only
+                # looks identical to a hybrid one when you inspect the results.
+                "mode": "bm25+vector"
+                if (r.bm25_score is not None and r.vector_score is not None)
+                else ("vector" if r.vector_score is not None else "bm25"),
+            }
+            for r in results
+        ]
 
     # -- artifacts ----------------------------------------------------------
+
+    @app.post("/api/sessions/{session_id}/ledger/{item_id}")
+    async def edit_ledger(
+        request: Request, session_id: str, item_id: str, payload: LedgerEditRequest
+    ) -> dict[str, Any]:
+        _require_same_origin(request)
+        manager = mgr(request)
+        was_finished = (state := manager.get_state(session_id)) is not None and state.phase is Phase.DONE
+        try:
+            updated = manager.edit_ledger(session_id, item_id, payload.model_dump(exclude_unset=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if updated is None:
+            raise HTTPException(status_code=404, detail="ledger entry not found")
+        # A correction to a finished run reopens it at DELIVER; assembly is deterministic, so this costs
+        # no model calls and the stakeholder gets regenerated deliverables rather than a stale bundle.
+        if was_finished:
+            await manager.schedule(session_id, "advance")
+        return {"ok": True, "entry": updated, "deliverables_rebuilt": was_finished}
+
+    @app.get("/api/sessions/{session_id}/export")
+    async def export_bundle(request: Request, session_id: str) -> Response:
+        """ZIP of everything this session produced, for handing the deliverable to a stakeholder."""
+        import io
+        import zipfile
+
+        manager = mgr(request)
+        if manager.get_state(session_id) is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+        directory = manager.services.config.session_dir(session_id)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(directory.rglob("*")):
+                # `_render/` holds mmdc intermediates; a folder name starting with "_" is scratch by
+                # convention and must not ship in the stakeholder bundle.
+                if path.is_file() and not any(part.startswith("_") for part in path.relative_to(directory).parts):
+                    archive.write(path, path.name)
+        buffer.seek(0)
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{session_id}-deliverables.zip"'},
+        )
 
     @app.get("/api/artifacts/{session_id}/{name}")
     async def artifact(request: Request, session_id: str, name: str) -> Response:
@@ -369,6 +592,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     if WEB_DIR.exists():
         app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
     else:  # pragma: no cover - packaging safety net
+
         @app.get("/")
         async def index_missing() -> JSONResponse:
             return JSONResponse({"detail": f"web UI not found at {WEB_DIR}"}, status_code=404)
@@ -393,7 +617,9 @@ async def _read_capped_uploads(request: Request) -> list[tuple[str, bytes]]:
         async for chunk in request.stream():
             received += len(chunk)
             if received > MAX_UPLOAD_BYTES + 1024 * 1024:  # +1 MB multipart overhead allowance
-                raise HTTPException(status_code=413, detail=f"upload larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+                raise HTTPException(
+                    status_code=413, detail=f"upload larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
+                )
             yield chunk
 
     parser = MultiPartParser(request.headers, capped_stream())
@@ -401,7 +627,7 @@ async def _read_capped_uploads(request: Request) -> list[tuple[str, bytes]]:
         form = await parser.parse()
     except HTTPException:
         raise
-    except Exception as exc:  # noqa: BLE001 — malformed multipart is a client error, not a crash
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
 
     files: list[tuple[str, bytes]] = []
@@ -430,10 +656,21 @@ def _sanitize_inline_svg(html_text: str) -> str:
 
 
 def _sse(event: dict[str, Any]) -> str:
-    payload = {"id": event.get("id", 0), "ts": event.get("ts"), "type": event.get("type"),
-               "role": event.get("role", ""), "step": event.get("step", ""), "payload": event.get("payload", {})}
+    payload = {
+        "id": event.get("id", 0),
+        "ts": event.get("ts"),
+        "type": event.get("type"),
+        "role": event.get("role", ""),
+        "step": event.get("step", ""),
+        "payload": event.get("payload", {}),
+    }
     data = json.dumps(payload, ensure_ascii=False)
-    return f"id: {event.get('id', 0)}\nevent: {event.get('type')}\ndata: {data}\n\n"
+    # An `id:` line is what the browser stores as Last-Event-ID. Transient events (streamed tokens,
+    # reasoning) are never persisted and carry id 0, so emitting `id: 0` would rewind the reconnect
+    # cursor to the start of the log and replay everything. Omit the line for them instead.
+    event_id = int(event.get("id", 0) or 0)
+    id_line = f"id: {event_id}\n" if event_id > 0 else ""
+    return f"{id_line}event: {event.get('type')}\ndata: {data}\n\n"
 
 
 def _session_summary(manager: SessionManager, session_id: str, detailed: bool = False) -> dict[str, Any]:
@@ -460,27 +697,68 @@ def _session_summary(manager: SessionManager, session_id: str, detailed: bool = 
         "questions_total": len(state.questions),
         "requirements_total": len(state.requirements()),
         "metrics": state.metrics,
+        "has_transcript": bool((state.transcript or "").strip()),
+        "transcript_source": state.transcript_source,
     }
 
     if detailed:
-        summary.update({
-            "plan": state.plan.model_dump() if state.plan else None,
-            "questions": [q.model_dump() for q in state.questions],
-            "ledger": [i.model_dump() for i in state.ledger],
-            "summary_markdown": _summary_markdown(state),
-            "spec_markdown": state.spec_markdown,
-            "sections": state.sections,
-            "diagrams": state.diagrams,
-            "mermaid_code": state.mermaid_code,
-            "open_issues": [i.model_dump() for i in state.open_issues],
-            "lint_report": state.lint_report,
-            "artifacts": manager.services.store.list_artifacts(session_id),
-            "stats": spec_stats(state),
-            "approved_summary": state.approved_summary,
-            "review_rounds": state.review_rounds,
-            "gap_rounds": state.gap_round,
-        })
+        summary.update(
+            {
+                "plan": state.plan.model_dump() if state.plan else None,
+                "questions": [q.model_dump() for q in state.questions],
+                "ledger": [i.model_dump() for i in state.ledger],
+                "summary_markdown": _summary_markdown(state),
+                "spec_markdown": state.spec_markdown,
+                "sections": state.sections,
+                "diagrams": state.diagrams,
+                "mermaid_code": state.mermaid_code,
+                "open_issues": [i.model_dump() for i in state.open_issues],
+                "lint_report": state.lint_report,
+                "transcript": state.transcript,
+                "artifacts": manager.services.store.list_artifacts(session_id),
+                "stats": spec_stats(state),
+                "approved_summary": state.approved_summary,
+                "review_rounds": state.review_rounds,
+                "gap_rounds": state.gap_round,
+                "run_facts": _run_facts(manager, session_id),
+            }
+        )
     return summary
+
+
+def _run_facts(manager: SessionManager, session_id: str) -> dict[str, Any]:
+    """What the deliverable was actually built with, read back from the files on disk.
+
+    The gateway's usage counters are in-process only, so a session resumed in a different server would
+    report zero calls. metadata.json/pdf_qa.json are the durable record, and they are what a reviewer
+    needs: which PDF engine produced the file, which structured-output rung each call landed on, and
+    whether the QA gates passed.
+    """
+    directory = manager.services.config.out_dir(session_id)
+    facts: dict[str, Any] = {}
+
+    def _read_json(name: str) -> dict[str, Any] | None:
+        try:
+            value = json.loads((directory / name).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    metadata = _read_json("metadata.json")
+    if metadata:
+        facts["pdf_engine"] = metadata.get("pdf_engine") or "none"
+        facts["pdf_available"] = bool(metadata.get("pdf_available"))
+        facts["structured_output"] = metadata.get("structured_output") or {}
+        facts["llm_usage"] = metadata.get("llm_usage") or {}
+        facts["phase_metrics"] = metadata.get("phase_metrics") or {}
+
+    qa = _read_json("pdf_qa.json")
+    if qa:
+        facts["qa_ok"] = bool(qa.get("ok"))
+        facts["qa_warnings"] = (qa.get("warnings") or [])[:6]
+        facts["pages"] = (qa.get("checks") or {}).get("pages")
+
+    return facts
 
 
 def _summary_markdown(state) -> str:

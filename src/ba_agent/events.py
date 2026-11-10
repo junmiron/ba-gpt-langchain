@@ -3,29 +3,31 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+import contextlib
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 
 class EventType:
-    SESSION = "session"              # lifecycle: created/status/phase changed
-    STEP_START = "step_start"        # engine entered a step
-    STEP_END = "step_end"            # step finished (with metrics)
-    TOKEN = "token"                  # streamed model output
-    REASONING = "reasoning"          # streamed reasoning content (gpt-oss style models)
-    STATUS = "status"                # transient notice ("model may be loading…")
-    QUESTION = "question"            # a question is on screen, awaiting the user
-    ANSWER = "answer"                # user answer recorded
-    LEDGER = "ledger"                # ledger items added/updated
-    SPEC = "spec"                    # spec section / document updated
-    DIAGRAM = "diagram"              # mermaid produced/updated
-    REVIEW = "review"                # lint/critic verdicts
-    TOOL_CALL = "tool_call"          # agent loop invoked a tool
-    ARTIFACT = "artifact"            # file written and downloadable
-    APPROVAL = "approval"            # approval requested/granted
-    WARNING = "warning"              # recoverable problem (schema repair, degraded mode)
-    ERROR = "error"                  # step/session failure
-    LOG = "log"                      # free-form debug line
+    SESSION = "session"  # lifecycle: created/status/phase changed
+    STEP_START = "step_start"  # engine entered a step
+    STEP_END = "step_end"  # step finished (with metrics)
+    TOKEN = "token"  # streamed model output
+    REASONING = "reasoning"  # streamed reasoning content (gpt-oss style models)
+    STATUS = "status"  # transient notice ("model may be loading…")
+    QUESTION = "question"  # a question is on screen, awaiting the user
+    ANSWER = "answer"  # user answer recorded
+    LEDGER = "ledger"  # ledger items added/updated
+    SPEC = "spec"  # spec section / document updated
+    DIAGRAM = "diagram"  # mermaid produced/updated
+    REVIEW = "review"  # lint/critic verdicts
+    TOOL_CALL = "tool_call"  # agent loop invoked a tool
+    ARTIFACT = "artifact"  # file written and downloadable
+    APPROVAL = "approval"  # approval requested/granted
+    WARNING = "warning"  # recoverable problem (schema repair, degraded mode)
+    ERROR = "error"  # step/session failure
+    LOG = "log"  # free-form debug line
 
 
 EventPayload = dict[str, Any]
@@ -33,7 +35,7 @@ Emitter = Callable[[str, EventPayload], Awaitable[None]]
 
 
 class NullEmitter:
-    async def __call__(self, event_type: str, payload: EventPayload | None = None) -> None:  # noqa: D401
+    async def __call__(self, event_type: str, payload: EventPayload | None = None) -> None:
         return None
 
 
@@ -41,7 +43,7 @@ null_emitter = NullEmitter()
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
 
 
 #: Default live buffer per subscriber. Large enough that a whole review round never overflows a healthy tab.
@@ -92,12 +94,19 @@ class EventFanout:
             except asyncio.QueueEmpty:  # pragma: no cover - defensive
                 break
         warning = {
-            "id": 0, "session_id": session_id, "ts": now_iso(), "type": EventType.WARNING, "role": "", "step": "",
-            "payload": {"message": f"live stream fell behind and dropped {dropped} event(s); reload the page to "
-                                   "replay the full history", "dropped": dropped, "source": "fanout"},
+            "id": 0,
+            "session_id": session_id,
+            "ts": now_iso(),
+            "type": EventType.WARNING,
+            "role": "",
+            "step": "",
+            "payload": {
+                "message": f"live stream fell behind and dropped {dropped} event(s); reload the page to "
+                "replay the full history",
+                "dropped": dropped,
+                "source": "fanout",
+            },
         }
         for item in (warning, event):
-            try:
+            with contextlib.suppress(asyncio.QueueFull):  # two slots were just freed
                 queue.put_nowait(item)
-            except asyncio.QueueFull:  # pragma: no cover - two slots were just freed
-                pass
