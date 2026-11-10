@@ -11,6 +11,8 @@
 - **Real-model runs:** two full end-to-end runs against Strata `q2_0` completed with `E2E RESULT: PASS`, covering `--request-changes-first`, `--rag` and the post-delivery chat-tool path. Both produced a 29–30 page Typst PDF that passed the QA gate with zero warnings.
 - **Dead config:** 0 dead of 57 declared fields — every config key is read.
 
+Read `docs/RETROSPECTIVE-2026-11-10.md` for what this sprint measured, what failed, and the rules carried forward.
+
 ## Repository boundary — important
 
 - This repo is `Ba_langchain`, at `D:\Code\Ba_gpt\Ba_langchain`.
@@ -81,7 +83,7 @@
 
 ## Remaining work
 
-- **Tag + GitHub release.** `git remote -v` is empty — there is no remote configured, so `v1.0.0` cannot be pushed or tagged from here. Add a remote, then tag.
+- **Tag + GitHub release.** The remote now exists: `https://github.com/junmiron/ba-gpt-langchain` (`main` pushed 2026-11-10, CI green on Python 3.11 and 3.13). `v1.0.0` is still untagged.
 - **Real LM Studio run.** Not yet done: `curl http://127.0.0.1:1234/v1/models` → exit 7 (LM Studio not running). Run `scripts/e2e_lmstudio.py --provider lmstudio` when a chat model is loaded, to confirm the provider-specific rung ladder on a second backend.
 - **Vector retrieval is BM25-only under Strata** (no embedding endpoint). It works, but the UI should say so per provider rather than implying semantic search.
 - **Real-model runs are slow** (~25–35 min for a full interview on a local quantised model). Budget `--deadline-minutes` accordingly; the driver now nudges stalled sessions via `/api/sessions/{id}/resume`.
@@ -99,16 +101,17 @@ Run each gate separately and read the output — passing pytest does not imply t
 
 | Gate | Command | Result |
 |---|---|---|
-| Tests | `uv run pytest -q` | 590 passed, 1 deselected |
+| Tests (local) | `uv run pytest -q` | 590 passed, 1 deselected |
+| Tests (CI) | `pytest -q` | 582 passed, 8 skipped — 4 skip on a missing `typst` binary, 4 on a missing `mermaid-cli` |
 | Lint | `uv run ruff check src tests scripts` | All checks passed |
 | Format | `uv run ruff format --check src tests scripts` | clean |
 | Types | `uv run mypy src` | no issues in 39 source files |
 | UI syntax | `node --check src/ba_agent/web/app.js` | OK |
 | Offline acceptance | `uv run python scripts/e2e_offline.py` | exit 0 |
-| Live acceptance | `uv run python scripts/e2e_live.py --base http://127.0.0.1:8769` | 43 checks passed, 0 failed |
+| Live acceptance | `uv run python scripts/e2e_live.py --base http://127.0.0.1:8769` | all checks passed, 0 failed |
 | Real model | `uv run python scripts/e2e_lmstudio.py --provider strata --request-changes-first --rag` | PASS |
 
-`uv sync --extra dev` regenerates an untracked `uv.lock`; it is not committed.
+`uv.lock` is committed so CI and local runs resolve the same dependency set; `uv sync --extra dev` regenerates it.
 
 ## Commands and conventions
 
@@ -123,6 +126,6 @@ Run each gate separately and read the output — passing pytest does not imply t
 
 ## First next step
 
-1. Add a git remote, then tag `v1.0.0` and cut the release.
+1. Tag `v1.0.0` on the pushed `main` and cut the release.
 2. Run one real LM Studio pass when a chat model is loaded, to confirm the rung ladder on a second backend.
 3. Everything else is polish, not pending work.

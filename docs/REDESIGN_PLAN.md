@@ -228,7 +228,7 @@ Status is as-built (2026-11-09), not the original plan.
 rule in Part 6.1. Durability stays what Phase 0 already built: a `state_json` snapshot after every step plus
 SSE event replay. Nothing here is to be implemented.
 
-**Phase 5 — Release.** **DONE 2026-11-09** except the tag: optional bearer-token auth, version bump to 1.0.0, `CHANGELOG.md`, README/docs reconciliation, dead-config sweep (0 dead of 55), and real-model validation against Strata. `git remote -v` is empty, so `v1.0.0` cannot be tagged or published from this machine.
+**Phase 5 — Release.** **DONE 2026-11-09** except the tag: optional bearer-token auth, version bump to 1.0.0, `CHANGELOG.md`, README/docs reconciliation, dead-config sweep (0 dead of 57), and real-model validation against Strata. The repo is published at `github.com/junmiron/ba-gpt-langchain` with CI green; only the `v1.0.0` tag remains.
 
 ---
 
