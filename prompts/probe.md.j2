@@ -26,7 +26,27 @@ What we already have in the requirements ledger for this subject:
 
 Questions asked on this subject so far: {{ asked_count }}/{{ max_questions }}
 
+Project brief:
+{{ brief }}
+
+Objective: {{ objective }}
+
+Known facts:
+{% if known_facts %}{% for fact in known_facts %}- {{ fact }}
+{% endfor %}{% else %}- (none)
+{% endif %}
+
+Questions already asked (avoid repeating them):
+{% if previous_questions %}{% for previous in previous_questions %}- {{ previous }}
+{% endfor %}{% else %}- (none)
+{% endif %}
+
+Next subject, if this one is covered: {{ next_subject or "(none)" }}
+
 Return JSON:
 - covered: true if we can stop asking about this subject
 - reason: one short sentence
-- follow_up: null when covered is true, otherwise an object {question, rationale, kind, options} with ONE question
+- follow_up_question: blank when covered; otherwise one question on this subject
+- follow_up_rationale: why the follow-up is needed
+- next_question: when covered and a next subject is provided, one question for that next subject; otherwise blank
+- next_rationale: why that next-subject question matters

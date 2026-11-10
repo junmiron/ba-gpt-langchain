@@ -9,8 +9,15 @@ from __future__ import annotations
 
 import re
 
-from ..context import (assumptions_lines, facts_lines, ledger_digest, open_questions_lines,
-                       render_summary_markdown, requirements_rendered, risks_lines)
+from ..context import (
+    assumptions_lines,
+    facts_lines,
+    ledger_digest,
+    open_questions_lines,
+    render_summary_markdown,
+    requirements_rendered,
+    risks_lines,
+)
 from ..events import Emitter, EventType, null_emitter
 from ..prompts import render
 from ..schemas import SessionState, clean_markdown
@@ -25,8 +32,14 @@ def _summary_block(state: SessionState) -> str:
     return "(no approved summary — work directly from the ledger)"
 
 
-async def write_section(services: Services, state: SessionState, section: SectionSpec, *,
-                        extra_instructions: str = "", emit: Emitter = null_emitter) -> str:
+async def write_section(
+    services: Services,
+    state: SessionState,
+    section: SectionSpec,
+    *,
+    extra_instructions: str = "",
+    emit: Emitter = null_emitter,
+) -> str:
     system, user = render(
         "section",
         section={"id": section.id, "title": section.title, "guidance": section.guidance},
@@ -38,23 +51,30 @@ async def write_section(services: Services, state: SessionState, section: Sectio
         risks=risks_lines(state),
         open_questions=open_questions_lines(state),
         outline=outline_text(section.id),
-        knowledge_context=await services.knowledge.context_block(
-            f"{section.title} {state.brief[:200]}", max_chars=1600),
+        knowledge_context=await services.knowledge.context_block(f"{section.title} {state.seed[:200]}", max_chars=1600),
         target_words=section.target_words,
         extra_instructions=extra_instructions,
     )
     result = await services.gateway.stream_text(
-        system_prompt=system, user_prompt=user, role="writer", emit=emit, step=f"write:{section.id}",
-        model_override=session_model(state, "writer")
+        system_prompt=system,
+        user_prompt=user,
+        role="writer",
+        emit=emit,
+        step=f"write:{section.id}",
+        model_override=session_model(state, "writer"),
     )
     markdown = clean_markdown(result.text)
 
     if not markdown or len(markdown) < 60:
-        await emit(EventType.WARNING, {
-            "step": f"write:{section.id}", "role": "writer",
-            "message": f"'{section.title}' came back empty — writing a placeholder instead of failing the run",
-            "detail": (result.error or "")[:300],
-        })
+        await emit(
+            EventType.WARNING,
+            {
+                "step": f"write:{section.id}",
+                "role": "writer",
+                "message": f"'{section.title}' came back empty — writing a placeholder instead of failing the run",
+                "detail": (result.error or "")[:300],
+            },
+        )
         return ""
 
     # A model that ignores "no heading" would break the assembler's numbering.
@@ -68,15 +88,26 @@ async def write_use_cases(services: Services, state: SessionState, *, emit: Emit
     if summary and summary.stakeholders:
         stakeholders = list(summary.stakeholders)
     else:
-        stakeholders = [line for line in facts_lines(state)
-                        if re.search(r"\b(role|user|persona|team|admin|analyst)\b", line.lower())][:8]
+        stakeholders = [
+            line
+            for line in facts_lines(state)
+            if re.search(r"\b(role|user|persona|team|admin|analyst)\b", line.lower())
+        ][:8]
 
     scope_in = list(summary.scope_in) if summary else []
     scope_out = list(summary.scope_out) if summary else []
-    process_context = "\n".join(filter(None, [
-        ("In scope: " + "; ".join(scope_in[:8])) if scope_in else "",
-        ("Out of scope: " + "; ".join(scope_out[:8])) if scope_out else "",
-    ])) or "(scope not explicitly captured — derive it from the requirements)"
+    process_context = (
+        "\n".join(
+            filter(
+                None,
+                [
+                    ("In scope: " + "; ".join(scope_in[:8])) if scope_in else "",
+                    ("Out of scope: " + "; ".join(scope_out[:8])) if scope_out else "",
+                ],
+            )
+        )
+        or "(scope not explicitly captured — derive it from the requirements)"
+    )
 
     system, user = render(
         "use_cases",
@@ -88,8 +119,12 @@ async def write_use_cases(services: Services, state: SessionState, *, emit: Emit
         max_use_cases=min(8, max(3, len(state.requirements()))),
     )
     result = await services.gateway.stream_text(
-        system_prompt=system, user_prompt=user, role="use_cases", emit=emit, step="write:use_cases",
-        model_override=session_model(state, "use_cases")
+        system_prompt=system,
+        user_prompt=user,
+        role="use_cases",
+        emit=emit,
+        step="write:use_cases",
+        model_override=session_model(state, "use_cases"),
     )
     markdown = clean_markdown(result.text)
     if "UC-" not in markdown and markdown:
@@ -97,13 +132,17 @@ async def write_use_cases(services: Services, state: SessionState, *, emit: Emit
     return markdown
 
 
-async def write_glossary(services: Services, state: SessionState, corpus: str, *,
-                         emit: Emitter = null_emitter) -> str:
-    system, user = render("glossary", project_name=(state.plan.project_name if state.plan else state.title),
-                          corpus=corpus[:7000])
+async def write_glossary(services: Services, state: SessionState, corpus: str, *, emit: Emitter = null_emitter) -> str:
+    system, user = render(
+        "glossary", project_name=(state.plan.project_name if state.plan else state.title), corpus=corpus[:7000]
+    )
     result = await services.gateway.stream_text(
-        system_prompt=system, user_prompt=user, role="glossary", emit=emit, step="write:glossary",
-        model_override=session_model(state, "glossary")
+        system_prompt=system,
+        user_prompt=user,
+        role="glossary",
+        emit=emit,
+        step="write:glossary",
+        model_override=session_model(state, "glossary"),
     )
     markdown = clean_markdown(result.text)
     if not markdown:
@@ -111,13 +150,31 @@ async def write_glossary(services: Services, state: SessionState, corpus: str, *
     if not re.search(r"^-\s+\*\*", markdown, flags=re.M):
         # Model produced a table or plain list — normalise to the "- **Term** — definition" shape.
         lines = []
+        table_rows: list[list[str]] = []
         for line in markdown.splitlines():
-            stripped = line.strip().lstrip("-*•").strip()
-            if not stripped or stripped.startswith("#") or "|" in stripped[:3]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("|"):
+                table_rows.append([cell.strip() for cell in stripped.strip("|").split("|")])
+                continue
+            stripped = stripped.lstrip("-*•").strip()
+            if not stripped:
                 continue
             parts = re.split(r"\s+[—:-]\s+", stripped, maxsplit=1)
             if len(parts) == 2 and len(parts[0]) <= 60:
                 lines.append(f"- **{parts[0].strip()}** — {parts[1].strip()}")
+
+        if table_rows:
+            # In `| Term | Meaning |` / `| --- | --- |` / `| Claim | ... |`, the row above the separator is
+            # the header, not a definition. A table with no separator keeps all of its rows.
+            for position, row in enumerate(table_rows):
+                if all(set(cell) <= set("-: ") for cell in row):
+                    if lines and lines[-1].startswith("- **") and position > 0:
+                        lines.pop()  # header emitted on the previous iteration
+                    continue
+                if len(row) >= 2 and row[0] and row[1]:
+                    lines.append(f"- **{row[0]}** — {row[1]}")
         markdown = "\n".join(lines) or markdown
     return markdown
 

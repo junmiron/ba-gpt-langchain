@@ -8,12 +8,20 @@ from ba_agent.schemas import AwaitKind, Phase, RunStatus
 from ba_agent.workflow import WorkflowEngine
 from conftest import FakeGateway
 
-BRIEF = ("We need a portal for insurance brokers to submit and track claims. Today everything is email. "
-         "About 300 brokers, peak in winter, must integrate with the existing policy system over REST.")
+BRIEF = (
+    "We need a portal for insurance brokers to submit and track claims. Today everything is email. "
+    "About 300 brokers, peak in winter, must integrate with the existing policy system over REST."
+)
 
 
-async def drive(services, *, brief: str = BRIEF, answer: str = "Around 400 claims per month, mostly PDFs.",
-                approve: bool = True, max_turns: int = 60):
+async def drive(
+    services,
+    *,
+    brief: str = BRIEF,
+    answer: str = "Around 400 claims per month, mostly PDFs.",
+    approve: bool = True,
+    max_turns: int = 60,
+):
     """Run the engine to completion, answering every pending question like a stakeholder would."""
     state = services.store.create_session(brief=brief)
     engine = WorkflowEngine(services)
@@ -33,7 +41,9 @@ async def drive(services, *, brief: str = BRIEF, answer: str = "Around 400 claim
         elif state.awaiting is AwaitKind.APPROVAL:
             await engine.set_approval(state, approve, "" if approve else "please add the approval step", emit=emit)
         else:
-            pytest.fail(f"engine stalled in phase={state.phase.value} awaiting={state.awaiting.value} error={state.error}")
+            pytest.fail(
+                f"engine stalled in phase={state.phase.value} awaiting={state.awaiting.value} error={state.error}"
+            )
     return state, events
 
 
@@ -89,7 +99,7 @@ async def test_review_needs_user_escalates_back_to_stakeholder(config, fake_gate
 
     services.knowledge = KnowledgeService(services.store, gateway, config)
 
-    state, events = await drive(services)
+    state, _events = await drive(services)
 
     review_questions = [q for q in state.questions if q.purpose == "review"]
     assert len(review_questions) == 1
@@ -130,7 +140,14 @@ async def test_probe_that_never_covers_is_bounded_by_subject_budget(config, fake
     state, _ = await drive(services, max_turns=80)
 
     agenda = [q for q in state.questions if q.purpose == "agenda"]
-    assert len(agenda) == len(state.subjects) * config.interview.max_questions_per_subject
+    # The probe keeps asking "and who approves it?" for every subject; the dedup guard stops the
+    # engine from re-asking the identical question, so the budget is a ceiling, not a quota.
+    assert len(agenda) <= len(state.subjects) * config.interview.max_questions_per_subject
+    per_subject = {q.subject for q in agenda}
+    assert all(
+        sum(1 for x in agenda if x.subject == subject) <= config.interview.max_questions_per_subject
+        for subject in per_subject
+    )
     assert len(state.questions) <= config.interview.max_total_questions
     assert state.phase is Phase.DONE
 
@@ -202,8 +219,8 @@ async def test_run_is_resumable_from_sqlite(services):
 
 @pytest.mark.asyncio
 async def test_run_stops_with_an_actionable_error_when_no_model_is_available(services):
-    """LM Studio being off must produce one clear, resumable error — not a hollow document."""
-    from ba_agent.models import NO_MODEL_MESSAGE
+    """An offline backend must produce one clear, resumable error — not a hollow document."""
+    from ba_agent.models import no_model_message
 
     class NoModelGateway(FakeGateway):
         async def resolve_model(self, requested: str | None) -> str | None:
@@ -223,10 +240,10 @@ async def test_run_stops_with_an_actionable_error_when_no_model_is_available(ser
     await engine.advance(state, emit=emit)
 
     assert state.status is RunStatus.ERROR
-    assert NO_MODEL_MESSAGE in (state.error or "")
-    assert [event_type for event_type, _ in seen] == ["error"]   # one legible failure, no retry storm
-    assert gateway.calls == []                                    # nothing was attempted
-    assert state.phase is Phase.INTAKE                            # resumable from where it stopped
+    assert no_model_message(services.config.provider) in (state.error or ""), state.error
+    assert [event_type for event_type, _ in seen] == ["error"]  # one legible failure, no retry storm
+    assert gateway.calls == []  # nothing was attempted
+    assert state.phase is Phase.INTAKE  # resumable from where it stopped
 
 
 @pytest.mark.asyncio

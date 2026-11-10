@@ -34,37 +34,82 @@ class SectionSpec:
 
 SPEC_TEMPLATE: tuple[SectionSpec, ...] = (
     SectionSpec(id="title", title="", guidance="", kind="static", required=False),
-    SectionSpec(id="introduction", title="1. Introduction",
-                guidance="Purpose of the document, project background, business objectives and success measures.",
-                target_words=220, min_chars=200),
-    SectionSpec(id="scope", title="2. Scope",
-                guidance="In scope / out of scope lists, plus explicit boundaries with adjacent systems.",
-                target_words=220, min_chars=200),
-    SectionSpec(id="functional_requirements", title="3. Functional Requirements",
-                guidance="Numbered requirements reusing the ledger ids (FR-001 …). One behaviour per requirement, "
-                         "grouped by capability with ### sub-headings.",
-                target_words=420, min_chars=400),
-    SectionSpec(id="non_functional_requirements", title="4. Non-Functional Requirements",
-                guidance="Performance, security, compliance, availability and usability targets as a table with "
-                         "measurable values; mark unknown targets TBD.",
-                target_words=260, min_chars=220),
-    SectionSpec(id="roles_personas", title="5. User Roles & Personas",
-                guidance="Who uses the system, their goals, permissions and frequency of use — as a table.",
-                target_words=220, min_chars=180),
-    SectionSpec(id="assumptions_constraints", title="6. Assumptions & Constraints",
-                guidance="Technical, organisational and regulatory constraints; assumptions that must be validated.",
-                target_words=180, min_chars=150),
-    SectionSpec(id="risks_dependencies", title="7. Risks & Dependencies",
-                guidance="Risks with impact/likelihood/mitigation and external dependencies (systems, teams, data).",
-                target_words=180, min_chars=140),
-    SectionSpec(id="use_cases", title="8. Use Cases & User Stories",
-                guidance="Use cases UC-01… plus user stories with acceptance criteria.", kind="use_cases",
-                target_words=700, min_chars=500),
-    SectionSpec(id="glossary", title="9. Glossary", guidance="Project-specific terms and acronyms.",
-                kind="glossary", target_words=260, min_chars=180),
+    SectionSpec(
+        id="introduction",
+        title="1. Introduction",
+        guidance="Purpose of the document, project background, business objectives and success measures.",
+        target_words=220,
+        min_chars=200,
+    ),
+    SectionSpec(
+        id="scope",
+        title="2. Scope",
+        guidance="In scope / out of scope lists, plus explicit boundaries with adjacent systems.",
+        target_words=220,
+        min_chars=200,
+    ),
+    SectionSpec(
+        id="functional_requirements",
+        title="3. Functional Requirements",
+        guidance="Numbered requirements reusing the ledger ids (FR-001 …). One behaviour per requirement, "
+        "grouped by capability with ### sub-headings.",
+        target_words=420,
+        min_chars=400,
+    ),
+    SectionSpec(
+        id="non_functional_requirements",
+        title="4. Non-Functional Requirements",
+        guidance="Performance, security, compliance, availability and usability targets as a table with "
+        "measurable values; mark unknown targets TBD.",
+        target_words=260,
+        min_chars=220,
+    ),
+    SectionSpec(
+        id="roles_personas",
+        title="5. User Roles & Personas",
+        guidance="Who uses the system, their goals, permissions and frequency of use — as a table.",
+        target_words=220,
+        min_chars=180,
+    ),
+    SectionSpec(
+        id="assumptions_constraints",
+        title="6. Assumptions & Constraints",
+        guidance="Technical, organisational and regulatory constraints; assumptions that must be validated.",
+        target_words=180,
+        min_chars=150,
+    ),
+    SectionSpec(
+        id="risks_dependencies",
+        title="7. Risks & Dependencies",
+        guidance="Risks with impact/likelihood/mitigation and external dependencies (systems, teams, data).",
+        target_words=180,
+        min_chars=140,
+    ),
+    SectionSpec(
+        id="use_cases",
+        title="8. Use Cases & User Stories",
+        guidance="Use cases UC-01… plus user stories with acceptance criteria.",
+        kind="use_cases",
+        target_words=700,
+        min_chars=500,
+    ),
+    SectionSpec(
+        id="glossary",
+        title="9. Glossary",
+        guidance="Project-specific terms and acronyms.",
+        kind="glossary",
+        target_words=260,
+        min_chars=180,
+    ),
     SectionSpec(id="open_questions", title="10. Open Questions & Gaps", guidance="", kind="static", min_chars=40),
-    SectionSpec(id="traceability", title="Appendix A — Requirements Traceability", guidance="", kind="static",
-                required=False, min_chars=60),
+    SectionSpec(
+        id="traceability",
+        title="Appendix A — Requirements Traceability",
+        guidance="",
+        kind="static",
+        required=False,
+        min_chars=60,
+    ),
 )
 
 LLM_SECTIONS = [s for s in SPEC_TEMPLATE if s.kind == "llm"]
@@ -134,8 +179,10 @@ def render_traceability(state: SessionState) -> str:
     requirements = state.requirements()
     if not requirements:
         return "_No requirements captured._"
-    rows = ["| ID | Requirement | Category | Priority | Acceptance criteria | Source question |",
-            "|---|---|---|---|---|---|"]
+    rows = [
+        "| ID | Requirement | Category | Priority | Acceptance criteria | Source question |",
+        "|---|---|---|---|---|---|",
+    ]
     for item in requirements:
         acceptance = "; ".join(item.acceptance) if item.acceptance else "_missing_"
         source = f"Q{item.source_q}" if item.source_q else "—"
@@ -180,6 +227,11 @@ def assemble_spec(state: SessionState, version: str = "0.1") -> str:
     for section in SPEC_TEMPLATE:
         if section.id == "title":
             parts.append(render_title(state, version=version))
+            if any(question.answer_source == "simulated" for question in state.questions):
+                parts.append(
+                    "> **Simulation notice:** This document includes simulated stakeholder answers; "
+                    "they are test data and have not been validated by a real stakeholder."
+                )
             continue
         body = resolved_section_body(state, section.id)
         if not body:
@@ -258,67 +310,94 @@ def lint_spec(state: SessionState, *, min_functional_requirements: int = 5) -> l
             continue
         body = resolved_section_body(state, section.id)
         if not body:
-            findings.append(LintFinding("missing_section", f"Section '{section.title}' is missing.",
-                                        "blocker", "internal", section.id))
+            findings.append(
+                LintFinding(
+                    "missing_section", f"Section '{section.title}' is missing.", "blocker", "internal", section.id
+                )
+            )
         elif len(body) < section.min_chars:
-            findings.append(LintFinding("thin_section",
-                                        f"Section '{section.title}' has only {len(body)} characters "
-                                        f"(expected ≥{section.min_chars}).",
-                                        "warning" if len(body) > section.min_chars // 2 else "blocker",
-                                        "internal", section.id))
+            findings.append(
+                LintFinding(
+                    "thin_section",
+                    f"Section '{section.title}' has only {len(body)} characters (expected ≥{section.min_chars}).",
+                    "warning" if len(body) > section.min_chars // 2 else "blocker",
+                    "internal",
+                    section.id,
+                )
+            )
 
     requirements = state.requirements()
     functional = [r for r in requirements if (r.category and r.category.value == "functional")]
 
     min_fr = max(1, int(min_functional_requirements))
     if len(functional) < int(min_fr):
-        findings.append(LintFinding(
-            "too_few_requirements",
-            f"Only {len(functional)} functional requirements captured (expected ≥{int(min_fr)}).",
-            "blocker", "user",
-            question_for_user="Which main capabilities must the system provide? Please list the things users "
-                              "actually need to do, one per line — I will turn them into requirements."))
+        findings.append(
+            LintFinding(
+                "too_few_requirements",
+                f"Only {len(functional)} functional requirements captured (expected ≥{int(min_fr)}).",
+                "blocker",
+                "user",
+                question_for_user="Which main capabilities must the system provide? Please list the things users "
+                "actually need to do, one per line — I will turn them into requirements.",
+            )
+        )
 
     doc = state.spec_markdown or assemble_spec(state)
 
     # Traceability is checked against the *narrative* sections only. The appendix lists every id by construction,
     # so including it would make this check vacuous — what matters is whether the prose actually uses them.
-    narrative = "\n".join(resolved_section_body(state, section.id) for section in SPEC_TEMPLATE
-                          if section.kind != "static")
+    narrative = "\n".join(
+        resolved_section_body(state, section.id) for section in SPEC_TEMPLATE if section.kind != "static"
+    )
     missing_ids = [r.id for r in requirements if r.id not in narrative]
     if missing_ids:
-        findings.append(LintFinding("untraceable_requirements",
-                                    f"Requirements not referenced in the document body: {', '.join(missing_ids[:12])}.",
-                                    "warning", "internal"))
+        findings.append(
+            LintFinding(
+                "untraceable_requirements",
+                f"Requirements not referenced in the document body: {', '.join(missing_ids[:12])}.",
+                "warning",
+                "internal",
+            )
+        )
 
-    must_without_acceptance = [r.id for r in requirements
-                               if (r.priority and r.priority.value == "must") and not r.acceptance]
+    must_without_acceptance = [
+        r.id for r in requirements if (r.priority and r.priority.value == "must") and not r.acceptance
+    ]
     if must_without_acceptance:
-        findings.append(LintFinding("missing_acceptance_criteria",
-                                    f"'must' requirements without acceptance criteria: "
-                                    f"{', '.join(must_without_acceptance[:12])}.",
-                                    "warning", "internal"))
+        findings.append(
+            LintFinding(
+                "missing_acceptance_criteria",
+                f"'must' requirements without acceptance criteria: {', '.join(must_without_acceptance[:12])}.",
+                "warning",
+                "internal",
+            )
+        )
 
     covered_topics = nfr_topics_mentioned(doc)
     uncovered = sorted(set(NFR_TOPICS) - covered_topics)
     if len(uncovered) >= NFR_UNCOVERED_THRESHOLD:
-        findings.append(LintFinding("nfr_coverage",
-                                    f"Non-functional targets not addressed for: {', '.join(uncovered)}.",
-                                    "warning", "user"))
+        findings.append(
+            LintFinding(
+                "nfr_coverage", f"Non-functional targets not addressed for: {', '.join(uncovered)}.", "warning", "user"
+            )
+        )
 
     use_cases = state.sections.get("use_cases", "")
     if "UC-" not in use_cases and len(functional) > 0:
-        findings.append(LintFinding("no_use_cases", "Use Cases section has no UC- identifiers.",
-                                    "blocker", "internal", "use_cases"))
+        findings.append(
+            LintFinding("no_use_cases", "Use Cases section has no UC- identifiers.", "blocker", "internal", "use_cases")
+        )
     glossary = state.sections.get("glossary", "")
     if len([line for line in glossary.splitlines() if line.strip().startswith("- **")]) < 5:
-        findings.append(LintFinding("thin_glossary", "Glossary defines fewer than 5 terms.",
-                                    "warning", "internal", "glossary"))
+        findings.append(
+            LintFinding("thin_glossary", "Glossary defines fewer than 5 terms.", "warning", "internal", "glossary")
+        )
 
     tbd_count = len(re.findall(r"\bTBD\b", doc, flags=re.I))
     if tbd_count > 8:
-        findings.append(LintFinding("too_many_tbd", f"{tbd_count} 'TBD' placeholders remain in the document.",
-                                    "warning", "user"))
+        findings.append(
+            LintFinding("too_many_tbd", f"{tbd_count} 'TBD' placeholders remain in the document.", "warning", "user")
+        )
 
     return findings
 
@@ -335,8 +414,10 @@ def deterministic_gaps(state: SessionState, *, min_functional_requirements: int 
 
     floor = max(1, int(min_functional_requirements))
     if len(functional) < floor:
-        gaps.append(f"Only {len(functional)} functional requirement(s) captured (expected at least {floor}) — "
-                    f"we need the main capabilities the system must provide.")
+        gaps.append(
+            f"Only {len(functional)} functional requirement(s) captured (expected at least {floor}) — "
+            f"we need the main capabilities the system must provide."
+        )
     if not any(r.category and r.category.value == "non_functional" for r in requirements):
         gaps.append("No non-functional targets (performance, security, availability) were captured.")
     if not state.summary or not state.summary.scope_in:

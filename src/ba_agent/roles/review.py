@@ -6,14 +6,23 @@ from ..events import Emitter, EventType, null_emitter
 from ..prompts import render
 from ..schemas import CriticVerdict, Issue, SessionState
 from ..services import Services, session_model
-from ..spec import LintFinding, SPEC_TEMPLATE
+from ..spec import SPEC_TEMPLATE, LintFinding
 
 
 def issues_from_lint(findings: list[LintFinding]) -> list[Issue]:
     """Turn code-detected problems into the same shape as critic issues."""
-    return [Issue(section_id=f.section_id, kind=f.kind, severity=f.severity,  # type: ignore[arg-type]
-                  description=f.message, fix_hint="", question_for_user=f.question_for_user,
-                  source="lint") for f in findings]
+    return [
+        Issue(
+            section_id=f.section_id,
+            kind=f.kind,
+            severity=f.severity,
+            description=f.message,
+            fix_hint="",
+            question_for_user=f.question_for_user,
+            source="lint",
+        )
+        for f in findings
+    ]
 
 
 def verdict_from_lint(findings: list[LintFinding]) -> CriticVerdict:
@@ -24,8 +33,9 @@ def verdict_from_lint(findings: list[LintFinding]) -> CriticVerdict:
         status = "needs_user"
     elif blockers:
         status = "auto_fixable"
-    return CriticVerdict(status=status, summary="Deterministic checker verdict (LLM critic unavailable).",
-                         issues=issues)
+    return CriticVerdict(
+        status=status, summary="Deterministic checker verdict (LLM critic unavailable).", issues=issues
+    )
 
 
 #: The critic reviews the whole document where it fits. Beyond the cap the head keeps the early sections and
@@ -39,8 +49,10 @@ def _spec_for_critic(document: str) -> str:
     if len(document) <= limit:
         return document
     omitted = len(document) - limit
-    return (f"{document[:CRITIC_SPEC_HEAD_CHARS]}\n\n[… {omitted} characters omitted from the middle of the document …]"
-            f"\n\n{document[-CRITIC_SPEC_TAIL_CHARS:]}")
+    return (
+        f"{document[:CRITIC_SPEC_HEAD_CHARS]}\n\n[… {omitted} characters omitted from the middle of the document …]"
+        f"\n\n{document[-CRITIC_SPEC_TAIL_CHARS:]}"
+    )
 
 
 #: Upper bound on issues shown to the writer per review round.
@@ -60,8 +72,9 @@ def _cap_issues(issues: list[Issue]) -> list[Issue]:
     return blockers + rest[: MAX_REVIEW_ISSUES - len(blockers)]
 
 
-async def critique(services: Services, state: SessionState, findings: list[LintFinding], *,
-                   emit: Emitter = null_emitter) -> CriticVerdict:
+async def critique(
+    services: Services, state: SessionState, findings: list[LintFinding], *, emit: Emitter = null_emitter
+) -> CriticVerdict:
     lint_lines = [finding.line() for finding in findings]
     document = _spec_for_critic(state.spec_markdown or "")
 
@@ -73,17 +86,26 @@ async def critique(services: Services, state: SessionState, findings: list[LintF
         spec_markdown=document,
     )
     result = await services.gateway.structured(
-        CriticVerdict, system_prompt=system, user_prompt=user, role="critic", emit=emit, step="review:critic",
-        model_override=session_model(state, "critic")
+        CriticVerdict,
+        system_prompt=system,
+        user_prompt=user,
+        role="critic",
+        emit=emit,
+        step="review:critic",
+        model_override=session_model(state, "critic"),
     )
     verdict = result.parsed if isinstance(result.parsed, CriticVerdict) else None
 
     if verdict is None:
-        await emit(EventType.WARNING, {
-            "step": "review:critic", "role": "critic",
-            "message": "LLM critic unavailable — using the deterministic checker verdict only",
-            "detail": (result.error or "")[:300],
-        })
+        await emit(
+            EventType.WARNING,
+            {
+                "step": "review:critic",
+                "role": "critic",
+                "message": "LLM critic unavailable — using the deterministic checker verdict only",
+                "detail": (result.error or "")[:300],
+            },
+        )
         return verdict_from_lint(findings)
 
     # The linter is authoritative for structure: merge its findings in, deduplicated by description.

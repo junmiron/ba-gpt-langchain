@@ -6,7 +6,7 @@ Each test pins one defect so it cannot silently return. All run offline; the gat
 from __future__ import annotations
 
 import asyncio
-import re
+from pathlib import Path
 
 import pytest
 
@@ -15,9 +15,16 @@ from ba_agent.events import EventType
 from ba_agent.mermaid_utils import clean_mermaid, quote_risky_labels, validate_mermaid
 from ba_agent.prompts import render
 from ba_agent.roles import analysis, review
-from ba_agent.roles.review import issues_from_lint
-from ba_agent.schemas import (CriticVerdict, DiagramDraft, Issue, LedgerItem, RequirementCategory, SessionState,
-                              SubjectSpec, SummaryDoc)
+from ba_agent.schemas import (
+    CriticVerdict,
+    DiagramDraft,
+    Issue,
+    LedgerItem,
+    RequirementCategory,
+    SessionState,
+    SubjectSpec,
+    SummaryDoc,
+)
 from ba_agent.spec import LintFinding, deterministic_gaps, lint_spec, nfr_topics_mentioned
 
 
@@ -31,8 +38,13 @@ def _req(index: int, body: str, category=RequirementCategory.FUNCTIONAL) -> Ledg
 def test_r1_template_without_user_marker_keeps_its_whole_persona_as_system_prompt(config):
     """chat_agent.md.j2 has no ---USER--- marker; render() used to replace its persona with a generic line."""
     system, user = render(
-        "chat_agent", project_name="Claims Portal", phase="interview", status="running", awaiting="answer",
-        coverage_summary="Product: asking", requirement_count=3,
+        "chat_agent",
+        project_name="Claims Portal",
+        phase="interview",
+        status="running",
+        awaiting="answer",
+        coverage_summary="Product: asking",
+        requirement_count=3,
     )
     assert "You are the Business Analyst running a requirements-interview session" in system
     assert "helpful assistant" not in system
@@ -42,7 +54,10 @@ def test_r1_template_without_user_marker_keeps_its_whole_persona_as_system_promp
 
 def test_r1_templates_with_marker_still_split_system_and_user(config):
     system, user = render(
-        "triage", subject=type("S", (), {"name": "Scope"})(), question="Q?", answer="A.",
+        "triage",
+        subject=type("S", (), {"name": "Scope"})(),
+        question="Q?",
+        answer="A.",
         existing_titles=[],
     )
     assert system and user
@@ -56,7 +71,8 @@ def test_r2_distinct_requirements_sharing_a_prefix_are_not_merged():
     state = SessionState(session_id="s-r2", brief="brief")
     state.ledger.append(_req(1, "The system shall provide invoice export."))
     assert not state.has_similar("The system shall provide claim export."), (
-        "R2: a shared 24-char prefix ('The system shall provide') must not merge distinct requirements")
+        "R2: a shared 24-char prefix ('The system shall provide') must not merge distinct requirements"
+    )
 
 
 def test_r2_true_paraphrase_and_exact_repeat_are_still_deduplicated():
@@ -75,10 +91,13 @@ def test_r2_short_text_is_never_considered_duplicate():
 # --------------------------------------------------------------------------- R3 mermaid balanced parens
 
 
-@pytest.mark.parametrize("line, expected_label", [
-    ("A[total (net)] --> B[done]", "total (net)"),
-    ("A{Ok (y)?} --> B[done]", "Ok (y)?"),
-])
+@pytest.mark.parametrize(
+    "line, expected_label",
+    [
+        ("A[total (net)] --> B[done]", "total (net)"),
+        ("A{Ok (y)?} --> B[done]", "Ok (y)?"),
+    ],
+)
 def test_r3_balanced_parens_in_label_stay_valid(line, expected_label):
     fixed = quote_risky_labels(f"flowchart TD\n    {line}")
     report = validate_mermaid(fixed)
@@ -106,16 +125,21 @@ class _FakeServices:
         self.verdict = verdict
 
         class _Gateway:
-            async def structured(inner, schema, **kwargs):  # noqa: N805
+            async def structured(inner, schema, **kwargs):
                 from ba_agent.models import StructuredResult
+
                 return StructuredResult(parsed=self.verdict, raw_text="{}", method="json_schema", attempts=1)
 
         self.gateway = _Gateway()
 
 
 def test_r4_all_lint_blockers_survive_when_critic_floods_the_list(monkeypatch):
-    critic_issues = [Issue(section_id="scope", kind="internal", severity="blocker",
-                           description=f"critic blocker {i}", fix_hint="fix") for i in range(13)]
+    critic_issues = [
+        Issue(
+            section_id="scope", kind="internal", severity="blocker", description=f"critic blocker {i}", fix_hint="fix"
+        )
+        for i in range(13)
+    ]
     verdict = CriticVerdict(status="auto_fixable", summary="x", issues=critic_issues)
     findings = [LintFinding(f"code{i}", f"lint blocker {i}", "blocker", "internal", "scope") for i in range(13)]
 
@@ -129,8 +153,7 @@ def test_r4_all_lint_blockers_survive_when_critic_floods_the_list(monkeypatch):
 
 
 def test_r4_cap_still_applies_to_non_blocker_issues():
-    critic_issues = [Issue(section_id="s", kind="internal", severity="warning", description=f"w{i}")
-                     for i in range(20)]
+    critic_issues = [Issue(section_id="s", kind="internal", severity="warning", description=f"w{i}") for i in range(20)]
     verdict = CriticVerdict(status="complete", summary="x", issues=critic_issues)
     services = _FakeServices(verdict)
     result = asyncio.run(review.critique(services, SessionState(session_id="s-r4b", brief="b"), []))
@@ -167,8 +190,13 @@ def test_r6_critic_prompt_includes_the_tail_of_a_long_spec(monkeypatch):
         async def structured(self, schema, *, system_prompt="", user_prompt="", **kwargs):
             captured["user"] = user_prompt
             from ba_agent.models import StructuredResult
-            return StructuredResult(parsed=CriticVerdict(status="complete", summary="ok", issues=[]),
-                                    raw_text="{}", method="json_schema", attempts=1)
+
+            return StructuredResult(
+                parsed=CriticVerdict(status="complete", summary="ok", issues=[]),
+                raw_text="{}",
+                method="json_schema",
+                attempts=1,
+            )
 
     class _Services:
         gateway = _Gateway()
@@ -208,8 +236,9 @@ def test_r8_write_use_cases_reads_scope_when_summary_present(config, services):
         return await original(**kwargs)
 
     services.gateway.stream_text = spy  # type: ignore[assignment]
-    state = SessionState(session_id="s-r8b", brief="brief",
-                         summary=SummaryDoc(scope_in=["Claim intake"], scope_out=["Payments"]))
+    state = SessionState(
+        session_id="s-r8b", brief="brief", summary=SummaryDoc(scope_in=["Claim intake"], scope_out=["Payments"])
+    )
     state.ledger.append(_req(1, "The system shall let a broker submit a claim with attachments."))
     asyncio.run(writing.write_use_cases(services, state))
     assert "In scope: Claim intake" in seen["user"]
@@ -234,7 +263,8 @@ def test_r9_scope_gap_still_fires_on_a_degraded_run():
         state.ledger.append(_req(index, f"The system shall provide capability number {index} with measurable output."))
     state.summary = analysis.deterministic_summary(state)
     assert any("in and out of scope" in gap for gap in deterministic_gaps(state)), (
-        "R9: the scope gap must fire when the fallback summary has no explicit scope")
+        "R9: the scope gap must fire when the fallback summary has no explicit scope"
+    )
 
 
 # --------------------------------------------------------------------------- R10 unified thresholds
@@ -275,8 +305,9 @@ def test_r11_gap_analysis_fallback_emits_warning(config, services):
     from ba_agent.models import StructuredResult
 
     async def failing(schema, **kwargs):
-        return StructuredResult(parsed=None, raw_text="", method="failed", attempts=3, degraded=True,
-                                error="schema failed")
+        return StructuredResult(
+            parsed=None, raw_text="", method="failed", attempts=3, degraded=True, error="schema failed"
+        )
 
     services.gateway.structured = failing  # type: ignore[assignment]
     events: list[tuple[str, dict]] = []
@@ -285,8 +316,7 @@ def test_r11_gap_analysis_fallback_emits_warning(config, services):
         events.append((event_type, payload or {}))
 
     state = SessionState(session_id="s-r11", brief="brief")
-    gaps = asyncio.run(analysis.gap_analysis(services, state, ["Only 1 functional requirement captured."],
-                                             emit=emit))
+    gaps = asyncio.run(analysis.gap_analysis(services, state, ["Only 1 functional requirement captured."], emit=emit))
     assert gaps and gaps[0].subject == "Clarification"
     warnings = [p for t, p in events if t == EventType.WARNING]
     assert warnings, "R11: a degraded gap analysis must surface a WARNING event"
@@ -298,8 +328,7 @@ def test_r11_diagram_reviewer_parse_failure_emits_warning(config, services):
     from ba_agent.roles import diagram
 
     async def failing(schema, **kwargs):
-        return StructuredResult(parsed=None, raw_text="", method="failed", attempts=3, degraded=True,
-                                error="no json")
+        return StructuredResult(parsed=None, raw_text="", method="failed", attempts=3, degraded=True, error="no json")
 
     services.gateway.structured = failing  # type: ignore[assignment]
     events: list[str] = []
@@ -309,8 +338,11 @@ def test_r11_diagram_reviewer_parse_failure_emits_warning(config, services):
             events.append((payload or {}).get("message", ""))
 
     state = SessionState(session_id="s-r11b", brief="brief")
-    result = asyncio.run(diagram.review_diagram(services, state, {"title": "t", "code": "flowchart TD\nA-->B"},
-                                                ["some error"], emit=emit))
+    result = asyncio.run(
+        diagram.review_diagram(
+            services, state, {"title": "t", "code": "flowchart TD\nA-->B"}, ["some error"], emit=emit
+        )
+    )
     assert result["summary"] == "reviewer unavailable"
     assert any("reviewer unavailable" in m or "unavailable" in m for m in events)
 
@@ -335,10 +367,12 @@ def test_r12_transcript_shows_skipped_and_not_applicable_rows():
 def test_r12_removed_dead_symbols_are_gone():
     import ba_agent.prompts as prompts
     import ba_agent.schemas as schemas
+
     assert not hasattr(prompts, "available_prompts")
     assert not hasattr(schemas, "SectionDraft")
     assert not hasattr(SessionState, "ledger_lines")
     import ba_agent.spec as spec_module
+
     assert not hasattr(spec_module, "ledger_lines")
 
 
@@ -355,8 +389,9 @@ def test_r11_probe_fail_open_emits_warning(config, services):
     from ba_agent.roles import interview
 
     async def failing(schema, **kwargs):
-        return StructuredResult(parsed=None, raw_text="", method="failed", attempts=3, degraded=True,
-                                error="schema failed")
+        return StructuredResult(
+            parsed=None, raw_text="", method="failed", attempts=3, degraded=True, error="schema failed"
+        )
 
     services.gateway.structured = failing  # type: ignore[assignment]
     events: list[tuple[str, dict]] = []
@@ -381,8 +416,15 @@ def test_r7_repair_is_judged_against_the_auto_fixed_baseline(config, services):
     from ba_agent.roles import diagram
     from ba_agent.schemas import DiagramSet, MermaidReviewResult
 
-    original = "\n".join(["flowchart TD", "    A(Order accepted) --> B[Done]", "    C(Ship it) --> D[x"])
-    worse = "\n".join(['flowchart TD', '    A["x" --> B["y"', '    C["z" --> D["w"'])
+    original = "\n".join(
+        [
+            "flowchart TD",
+            "    A[Order accepted | pending] --> B[Done]",
+            "    C(Ship it) --> D[x",
+            "    end[Stop] --> E[Yes]",
+        ]
+    )
+    worse = "\n".join(["flowchart TD", '    A["x" --> B["y"', '    C["z" --> D["w"'])
 
     auto_fixed = quote_risky_labels(original)
     baseline_errors = validate_mermaid(auto_fixed).errors
@@ -407,3 +449,41 @@ def test_r7_repair_is_judged_against_the_auto_fixed_baseline(config, services):
     shipped = diagrams[0]["code"]
     assert shipped == clean_mermaid(auto_fixed), shipped
     assert shipped != clean_mermaid(worse)
+
+
+def test_r12_diagram_png_is_stored_as_a_path_not_as_bytes(services, config):
+    """A rendered PNG must never enter `state_json`.
+
+    Raw image bytes are not JSON-serialisable, so putting them in the diagram dict makes every later
+    `save_state` raise PydanticSerializationError: the run silently stalls at the diagram phase and the
+    deliverables are never produced.
+    """
+    from ba_agent.export import write_deliverables
+    from ba_agent.roles import diagram
+    from ba_agent.schemas import SessionState
+
+    config.diagram.emit_png = True
+    config.diagram.local_renderer = True
+    state = SessionState(session_id="s-r12", brief="brief")
+
+    def fake_local(code, working_dir, *, timeout=120.0, want_png=False):
+        return '<svg xmlns="http://www.w3.org/2000/svg"></svg>', b"\x89PNG\r\n\x1a\n" + b"\x00" * 12, None
+
+    diagram.render_svg_local = fake_local  # type: ignore[assignment]
+    diagrams = asyncio.run(diagram.generate_diagrams(services, state))
+
+    assert diagrams, "the diagram should render"
+    entry = diagrams[0]
+    assert "png" not in entry, "diagram dicts must not carry raw PNG bytes"
+    png_path = Path(entry["png_path"])
+    assert png_path.exists(), "the PNG was not written to the deliverable folder"
+    assert png_path.read_bytes().startswith(b"\x89PNG"), "the PNG file is not a real PNG"
+
+    state.diagrams = diagrams
+    round_trip = SessionState.model_validate_json(state.model_dump_json())
+    assert round_trip.diagrams[0]["png_path"] == str(png_path)
+
+    written = write_deliverables(services, state)
+    png_artifacts = [a for a in written if a.name.endswith(".png")]
+    assert png_artifacts, "the rendered PNG is not shipped as a deliverable"
+    assert png_artifacts[0].bytes > 0

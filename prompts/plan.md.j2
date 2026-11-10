@@ -19,6 +19,13 @@ Reference material:
 {% if knowledge_context %}{{ knowledge_context }}
 {% else %}(none indexed){% endif %}
 
+{% if prior_lessons %}
+What previous interviews of this kind missed (learned from finished runs — make sure these subjects are
+covered or explicitly excluded):
+{% for lesson in prior_lessons %}- {{ lesson }}
+{% endfor %}
+{% endif %}
+
 ---USER---
 Project brief (as written by the stakeholder):
 """
