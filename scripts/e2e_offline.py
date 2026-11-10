@@ -144,7 +144,10 @@ def run_session(manager: SessionManager, gate: Gate, label: str, *, transcript: 
     gate.check(result.get("status") != "error", f"{label}: no error status", result.get("error", ""))
 
     files = {path.name for path in directory.iterdir() if path.is_file()}
-    missing = EXPECTED_FILES - files
+    # The `.typ` source only exists when Typst actually typeset the PDF — the ReportLab fallback never
+    # writes one. Expecting it unconditionally makes the gate fail on machines without a typst binary.
+    expected = EXPECTED_FILES if find_typst() else EXPECTED_FILES - {"functional_specification.typ"}
+    missing = expected - files
     gate.check(not missing, f"{label}: deliverable bundle is complete", f"missing: {sorted(missing)}")
 
     spec = (directory / "functional_specification.md").read_text(encoding="utf-8")
